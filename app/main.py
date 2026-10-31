@@ -51,6 +51,13 @@ async def lifespan(app: FastAPI):
     try:
         await init_db()
         logger.info("Database schema initialized successfully.")
+
+        # Ensure default trader & credentials from environment
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            from app.api.deps import get_current_user
+            await get_current_user(None, session)
+            logger.info("Default trader and Binance credentials verified on startup.")
     except Exception as e:
         logger.error(f"Database initialization error: {e}")
 

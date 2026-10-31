@@ -8,22 +8,29 @@ from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.entities import User, ExchangeConnection
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
-async def _ensure_binance_credentials(user: User, db: AsyncSession):
-    if settings.BINANCE_API_KEY and settings.BINANCE_API_SECRET:
+async def _ensure_binance_credentials(user_id: str, db: AsyncSession):
+    if not (settings.BINANCE_API_KEY and settings.BINANCE_API_SECRET):
+        return
+    try:
         from app.core.security import encrypt_secret
         stmt = select(ExchangeConnection).where(
-            ExchangeConnection.user_id == user.id,
+            ExchangeConnection.user_id == user_id,
             ExchangeConnection.exchange == "binance",
             ExchangeConnection.is_active == True
         )
-        conn = (await db.execute(stmt)).scalars().first()
+        res = await db.execute(stmt)
+        conn = res.scalars().first()
         if not conn:
             new_conn = ExchangeConnection(
-                user_id=user.id,
+                user_id=user_id,
                 exchange="binance",
                 api_key_encrypted=encrypt_secret(settings.BINANCE_API_KEY),
                 api_secret_encrypted=encrypt_secret(settings.BINANCE_API_SECRET),
@@ -34,10 +41,13 @@ async def _ensure_binance_credentials(user: User, db: AsyncSession):
                 can_withdraw=False
             )
             db.add(new_conn)
-            try:
-                await db.commit()
-            except Exception:
-                await db.rollback()
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"Could not auto-seed Binance credentials: {e}")
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
 
 async def get_current_user(
@@ -92,7 +102,8 @@ async def get_current_user(
         await db.refresh(default_user)
         target_user = default_user
 
-    await _ensure_binance_credentials(target_user, db)
+    user_id = str(target_user.id)
+    await _ensure_binance_credentials(user_id, db)
     return target_user
 
 
