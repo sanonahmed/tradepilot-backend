@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     BINANCE_USE_TESTNET: bool = True
     BINANCE_REST_BASE: str = "https://testnet.binance.vision"
     BINANCE_WS_BASE: str = "wss://testnet.binance.vision/ws"
+    BINANCE_API_KEY: Optional[str] = None
+    BINANCE_API_SECRET: Optional[str] = None
 
     # Gemini & FCM
     GEMINI_API_KEY: Optional[str] = None
