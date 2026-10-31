@@ -251,6 +251,47 @@ async def list_bots(
                 config.strategy_params = params
                 has_changes = True
 
+    # Auto-discover any active positions on Binance that don't have an active tracking bot yet!
+    active_bot_symbols = {b.symbol for b in all_bots if b.status == "active"}
+    for sym, bp in live_positions_details.items():
+        pos_amt = abs(bp.get("position_amt", Decimal("0")))
+        if sym not in active_bot_symbols and pos_amt > Decimal("0"):
+            ep = bp.get("entry_price") or Decimal("1.0")
+            notional = bp.get("notional") or (pos_amt * ep)
+            new_tracking_bot = TradingBot(
+                user_id=current_user.id,
+                name=f"{sym.replace('USDT', '')} Alpha Scanner Bot",
+                symbol=sym,
+                timeframe="15m",
+                operating_mode="live" if (conn and not conn.is_testnet) else "demo",
+                status="active",
+                allocated_budget=round(abs(notional), 2),
+                risk_percentage=Decimal("0.5"),
+                max_daily_trades=5
+            )
+            db.add(new_tracking_bot)
+            await db.flush()
+            new_conf = BotConfiguration(
+                bot_id=new_tracking_bot.id,
+                stop_loss_type="percentage",
+                stop_loss_value=Decimal("2.5"),
+                take_profit_type="percentage",
+                take_profit_value=Decimal("5.0"),
+                strategy_params={
+                    "binance_executed": True,
+                    "entry_price": float(ep),
+                    "current_price": float(bp.get("mark_price") or ep),
+                    "executed_quantity": float(pos_amt),
+                    "allocated_trade_usdt": float(abs(notional)),
+                    "take_profit_price": float(ep * Decimal("1.05")),
+                    "stop_loss_price": float(ep * Decimal("0.975")),
+                }
+            )
+            db.add(new_conf)
+            new_tracking_bot.configuration = new_conf
+            all_bots = list(all_bots) + [new_tracking_bot]
+            has_changes = True
+
     if has_changes:
         await db.commit()
 
