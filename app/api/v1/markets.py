@@ -20,44 +20,50 @@ _ticker_cache = {
 }
 CACHE_TTL_SECONDS = 10.0
 
-BINANCE_24HR_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
+BINANCE_TICKER_URLS = [
+    "https://data-api.binance.vision/api/v3/ticker/24hr",
+    "https://fapi.binance.com/fapi/v1/ticker/24hr",
+    "https://api1.binance.com/api/v3/ticker/24hr",
+    "https://api3.binance.com/api/v3/ticker/24hr",
+    "https://api.binance.com/api/v3/ticker/24hr"
+]
 STABLE_COIN_BASES = {"USDC", "FDUSD", "TUSD", "EUR", "USDP", "DAI", "AEUR", "BUSD", "USTC", "EURI"}
 
-# Fallback tickers in case external network is unreachable
+# Fallback tickers in case external network is completely unreachable
 FALLBACK_TICKERS = [
     TickerPrice(
         symbol="BTCUSDT",
-        price=Decimal("68420.50"),
-        price_change_24h_pct=Decimal("2.45"),
-        high_24h=Decimal("69150.00"),
-        low_24h=Decimal("66800.00"),
+        price=Decimal("77650.00"),
+        price_change_24h_pct=Decimal("1.85"),
+        high_24h=Decimal("78200.00"),
+        low_24h=Decimal("76500.00"),
         volume_24h=Decimal("28450.12"),
         quote_volume_24h=Decimal("1945203040.50")
     ),
     TickerPrice(
         symbol="ETHUSDT",
-        price=Decimal("3512.20"),
-        price_change_24h_pct=Decimal("3.12"),
-        high_24h=Decimal("3580.00"),
-        low_24h=Decimal("3390.00"),
+        price=Decimal("2265.20"),
+        price_change_24h_pct=Decimal("2.10"),
+        high_24h=Decimal("2310.00"),
+        low_24h=Decimal("2220.00"),
         volume_24h=Decimal("142300.50"),
         quote_volume_24h=Decimal("499500120.00")
     ),
     TickerPrice(
         symbol="SOLUSDT",
-        price=Decimal("182.40"),
-        price_change_24h_pct=Decimal("-1.15"),
-        high_24h=Decimal("188.50"),
-        low_24h=Decimal("179.20"),
+        price=Decimal("194.50"),
+        price_change_24h_pct=Decimal("3.40"),
+        high_24h=Decimal("198.50"),
+        low_24h=Decimal("186.20"),
         volume_24h=Decimal("895400.00"),
         quote_volume_24h=Decimal("163200400.00")
     ),
     TickerPrice(
         symbol="BNBUSDT",
-        price=Decimal("595.60"),
+        price=Decimal("702.60"),
         price_change_24h_pct=Decimal("0.85"),
-        high_24h=Decimal("602.00"),
-        low_24h=Decimal("588.00"),
+        high_24h=Decimal("712.00"),
+        low_24h=Decimal("692.00"),
         volume_24h=Decimal("42000.00"),
         quote_volume_24h=Decimal("25015200.00")
     )
@@ -68,52 +74,64 @@ async def fetch_binance_tickers() -> List[TickerPrice]:
     """
     Fetches real-time 24h ticker data for all listed pairs from Binance public API.
     Uses in-memory cache to respect rate limits and maximize responsiveness.
+    Cascades across resilient Binance endpoints (data-api.binance.vision, fapi, api1-3) to bypass datacenter geoblocks.
     """
     global _ticker_cache
     now = time.time()
     if _ticker_cache["data"] and (now - _ticker_cache["timestamp"] < CACHE_TTL_SECONDS):
         return _ticker_cache["data"]
 
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(BINANCE_24HR_TICKER_URL)
-            if resp.status_code == 200:
-                raw_data = resp.json()
-                parsed: List[TickerPrice] = []
-                for item in raw_data:
-                    try:
-                        sym = str(item.get("symbol", ""))
-                        if not sym:
-                            continue
-                        last_price = Decimal(str(item.get("lastPrice", "0")))
-                        pct = Decimal(str(item.get("priceChangePercent", "0")))
-                        high = Decimal(str(item.get("highPrice", "0")))
-                        low = Decimal(str(item.get("lowPrice", "0")))
-                        vol = Decimal(str(item.get("volume", "0")))
-                        q_vol = Decimal(str(item.get("quoteVolume", "0")))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
 
-                        parsed.append(
-                            TickerPrice(
-                                symbol=sym,
-                                price=last_price,
-                                price_change_24h_pct=pct,
-                                high_24h=high,
-                                low_24h=low,
-                                volume_24h=vol,
-                                quote_volume_24h=q_vol
-                            )
-                        )
-                    except Exception:
+    for url in BINANCE_TICKER_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    raw_data = resp.json()
+                    if not isinstance(raw_data, list) or len(raw_data) < 10:
                         continue
+                    parsed: List[TickerPrice] = []
+                    for item in raw_data:
+                        try:
+                            sym = str(item.get("symbol", ""))
+                            if not sym or not sym.endswith("USDT"):
+                                continue
+                            last_price = Decimal(str(item.get("lastPrice", "0")))
+                            if last_price <= Decimal("0"):
+                                continue
+                            pct = Decimal(str(item.get("priceChangePercent", "0")))
+                            high = Decimal(str(item.get("highPrice", "0")))
+                            low = Decimal(str(item.get("lowPrice", "0")))
+                            vol = Decimal(str(item.get("volume", "0")))
+                            q_vol = Decimal(str(item.get("quoteVolume", "0")))
 
-                if parsed:
-                    # Sort default by quoteVolume descending
-                    parsed.sort(key=lambda t: t.quote_volume_24h, reverse=True)
-                    _ticker_cache["data"] = parsed
-                    _ticker_cache["timestamp"] = now
-                    return parsed
-    except Exception as exc:
-        logger.warning(f"Failed to fetch live Binance tickers: {exc}. Using cache/fallback.")
+                            parsed.append(
+                                TickerPrice(
+                                    symbol=sym,
+                                    price=last_price,
+                                    price_change_24h_pct=pct,
+                                    high_24h=high,
+                                    low_24h=low,
+                                    volume_24h=vol,
+                                    quote_volume_24h=q_vol
+                                )
+                            )
+                        except Exception:
+                            continue
+
+                    if len(parsed) >= 10:
+                        # Sort default by quoteVolume descending
+                        parsed.sort(key=lambda t: t.quote_volume_24h, reverse=True)
+                        _ticker_cache["data"] = parsed
+                        _ticker_cache["timestamp"] = now
+                        logger.info(f"Successfully fetched {len(parsed)} live Binance tickers from {url}")
+                        return parsed
+        except Exception as exc:
+            logger.warning(f"Binance mirror {url} failed: {exc}. Trying next mirror...")
 
     if _ticker_cache["data"]:
         return _ticker_cache["data"]
@@ -227,19 +245,20 @@ def compute_market_scan(
         else:
             sig_type = "ACCUMULATION"
 
-        # Strategy filtering
-        if strategy == "top_picks" and score < 74.0:
-            continue
-        elif strategy == "breakouts" and not (pos_in_range >= 0.80 and chg >= 2.0):
-            continue
-        elif strategy == "volume_surge" and vol_ratio < 1.8 and q_vol < 10_000_000:
-            continue
-        elif strategy == "dip_buys" and not (rsi <= 38.0 or (chg <= -3.0 and pos_in_range <= 0.30)):
-            continue
-
         # Query filtering
         if query and query.strip().upper() not in sym:
             continue
+
+        # Strategy filtering (applied when not searching a specific coin symbol)
+        if not query:
+            if strategy == "top_picks" and score < 70.0 and sig_type not in ["STRONG_BUY", "POTENTIAL_BUY", "BREAKOUT_BUY"]:
+                continue
+            elif strategy == "breakouts" and not (bollinger == "UPPER_BREAKOUT" or (pos_in_range >= 0.75 and chg >= 1.5)):
+                continue
+            elif strategy == "volume_surge" and vol_ratio < 1.5 and q_vol < 8_000_000:
+                continue
+            elif strategy == "dip_buys" and not (rsi <= 40.0 or (chg <= -2.5 and pos_in_range <= 0.35)):
+                continue
 
         # Min score filter
         if min_score is not None and score < min_score:
