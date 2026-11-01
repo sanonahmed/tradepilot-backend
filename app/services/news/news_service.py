@@ -3,6 +3,7 @@ import logging
 import re
 import time
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from typing import Dict, Any, List, Optional
 import httpx
 
@@ -78,8 +79,8 @@ class NewsService:
     ) -> List[Dict[str, Any]]:
         """Retrieves and sentiment-tags live crypto news articles."""
         now = time.time()
-        # 60s cache to preserve performance
-        if not self._cached_news or (now - self._last_fetch) > 60.0:
+        # 30s live cache for rapid updates without being rate-limited
+        if not self._cached_news or (now - self._last_fetch) > 30.0:
             articles = await self._fetch_all_feeds()
             if articles:
                 self._cached_news = articles
@@ -128,6 +129,8 @@ class NewsService:
             items = root.findall(".//item")
             parsed = []
 
+            now_ts = int(time.time())
+
             for item in items[:15]:
                 title_el = item.find("title")
                 link_el = item.find("link")
@@ -139,6 +142,25 @@ class NewsService:
                 desc = desc_el.text.strip() if (desc_el is not None and desc_el.text) else ""
                 clean_desc = re.sub(r"<[^>]+>", "", desc)[:180].strip()
 
+                t_epoch = now_ts
+                raw_pub = pub_el.text.strip() if (pub_el is not None and pub_el.text) else ""
+                if raw_pub:
+                    try:
+                        dt = parsedate_to_datetime(raw_pub)
+                        t_epoch = int(dt.timestamp())
+                    except Exception:
+                        t_epoch = now_ts
+
+                diff_sec = max(0, now_ts - t_epoch)
+                if diff_sec < 60:
+                    rel_time = "Just now"
+                elif diff_sec < 3600:
+                    rel_time = f"{diff_sec // 60}m ago"
+                elif diff_sec < 86400:
+                    rel_time = f"{diff_sec // 3600}h ago"
+                else:
+                    rel_time = f"{diff_sec // 86400}d ago"
+
                 analysis = analyze_headline_sentiment(title, clean_desc)
 
                 parsed.append({
@@ -147,8 +169,9 @@ class NewsService:
                     "summary": clean_desc or f"Latest market development regarding {', '.join(analysis['coins_mentioned'])}.",
                     "url": link,
                     "source": source_name,
-                    "published_at": pub_el.text if (pub_el is not None and pub_el.text) else "Recently",
-                    "timestamp_epoch": int(time.time()),
+                    "published_at": rel_time,
+                    "published_at_raw": raw_pub,
+                    "timestamp_epoch": t_epoch,
                     "sentiment": analysis["sentiment"],
                     "sentiment_score": analysis["sentiment_score"],
                     "urgency": analysis["urgency"],
