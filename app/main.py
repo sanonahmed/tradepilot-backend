@@ -70,6 +70,15 @@ async def lifespan(app: FastAPI):
     except Exception as em_err:
         logger.error(f"Failed to start exit monitor: {em_err}")
 
+    # Launch Autonomous Auto-Pilot Background Loop
+    auto_task = None
+    try:
+        from app.services.trading.autonomous_engine import autonomous_background_loop, stop_autonomous_loop
+        auto_task = asyncio.create_task(autonomous_background_loop())
+        logger.info("Autonomous Auto-Pilot evaluation engine running in background.")
+    except Exception as auto_err:
+        logger.error(f"Failed to start autonomous engine: {auto_err}")
+
     yield
 
     # Shutdown
@@ -78,6 +87,14 @@ async def lifespan(app: FastAPI):
             from app.services.trading.exit_monitor import stop_exit_monitor
             stop_exit_monitor()
             monitor_task.cancel()
+        except Exception:
+            pass
+
+    if auto_task:
+        try:
+            from app.services.trading.autonomous_engine import stop_autonomous_loop
+            stop_autonomous_loop()
+            auto_task.cancel()
         except Exception:
             pass
     logger.info(f"Shutting down {settings.APP_NAME}")
