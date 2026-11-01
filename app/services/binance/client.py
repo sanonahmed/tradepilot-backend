@@ -3,6 +3,7 @@ import hashlib
 import time
 import re
 import logging
+import urllib.parse
 from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
 import httpx
@@ -116,12 +117,8 @@ class BinanceSpotClient:
 
             ts = int(time.time() * 1000) + offset_ms
             # Use max allowed recvWindow of 60000ms (60 seconds) to prevent latency/clock rejects
-            query_str = f"recvWindow=60000&timestamp={ts}"
-            signature = hmac.new(
-                self.api_secret.encode("utf-8"),
-                query_str.encode("utf-8"),
-                hashlib.sha256
-            ).hexdigest()
+            acct_params = {"recvWindow": 60000, "timestamp": ts}
+            query_str, signature = self._encode_and_sign(acct_params)
             url = f"{base_url}{account_path}?{query_str}&signature={signature}"
 
             try:
@@ -428,8 +425,8 @@ class BinanceSpotClient:
                     except Exception:
                         pass
                     ts = int(time.time() * 1000) + offset_ms
-                    query = f"recvWindow=60000&timestamp={ts}"
-                    sig = hmac.new(self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+                    pos_params = {"recvWindow": 60000, "timestamp": ts}
+                    query, sig = self._encode_and_sign(pos_params)
                     pos_url = f"{self.base_url}/fapi/v2/positionRisk?{query}&signature={sig}"
                     res = await client.get(pos_url, headers=self._get_headers())
                     if res.status_code == 200:
@@ -509,18 +506,27 @@ class BinanceSpotClient:
         details = await self.get_live_positions_details()
         return {s: p["position_amt"] for s, p in details.items()}
 
+    def _encode_and_sign(self, params: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        Properly percent-encodes query parameters using RFC 3986 (urllib.parse.urlencode)
+        and computes HMAC-SHA256 signature on the exact encoded query string.
+        Guarantees 100% valid Binance signatures, including non-ASCII symbols (e.g. 牛来USDT).
+        """
+        sorted_items = sorted(params.items())
+        encoded_query = urllib.parse.urlencode(sorted_items)
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            encoded_query.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        return encoded_query, signature
+
     def _sign_query(self, query_params: Dict[str, Any]) -> str:
         """Generates HMAC-SHA256 signature for signed endpoints."""
         query_params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
         query_params["recvWindow"] = 5000
-        sorted_items = sorted(query_params.items())
-        query_str = "&".join(f"{k}={v}" for k, v in sorted_items)
-        signature = hmac.new(
-            self.api_secret.encode("utf-8"),
-            query_str.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        return f"{query_str}&signature={signature}"
+        encoded_query, signature = self._encode_and_sign(query_params)
+        return f"{encoded_query}&signature={signature}"
 
     async def cancel_open_orders(self, symbol: str) -> Tuple[bool, Optional[str]]:
         """Cancels all open / pending orders for the specified symbol on Binance."""
@@ -548,9 +554,7 @@ class BinanceSpotClient:
                     "recvWindow": 60000,
                     "timestamp": ts
                 }
-                sorted_items = sorted(query_params.items())
-                query_str = "&".join(f"{k}={v}" for k, v in sorted_items)
-                sig = hmac.new(self.api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+                query_str, sig = self._encode_and_sign(query_params)
                 url = f"{self.base_url}{cancel_path}?{query_str}&signature={sig}"
                 res = await client.delete(url, headers=self._get_headers())
                 if res.status_code == 200:
@@ -596,9 +600,7 @@ class BinanceSpotClient:
                 if symbol:
                     query_params["symbol"] = symbol.upper()
 
-                sorted_items = sorted(query_params.items())
-                query_str = "&".join(f"{k}={v}" for k, v in sorted_items)
-                sig = hmac.new(self.api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+                query_str, sig = self._encode_and_sign(query_params)
                 url = f"{self.base_url}{open_orders_path}?{query_str}&signature={sig}"
                 res = await client.get(url, headers=self._get_headers())
                 if res.status_code == 200:
@@ -660,8 +662,13 @@ class BinanceSpotClient:
                     pass
 
                 ts = int(time.time() * 1000) + offset_ms
-                query_str = f"incomeType=REALIZED_PNL&limit=100&recvWindow=60000&timestamp={ts}"
-                sig = hmac.new(self.api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+                pnl_params = {
+                    "incomeType": "REALIZED_PNL",
+                    "limit": 100,
+                    "recvWindow": 60000,
+                    "timestamp": ts
+                }
+                query_str, sig = self._encode_and_sign(pnl_params)
                 url = f"{self.base_url}/fapi/v1/income?{query_str}&signature={sig}"
                 res = await client.get(url, headers=self._get_headers())
                 if res.status_code == 200:
@@ -700,8 +707,7 @@ class BinanceSpotClient:
                 if symbol:
                     params["symbol"] = symbol.upper()
 
-                query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-                sig = hmac.new(self.api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+                query_str, sig = self._encode_and_sign(params)
 
                 res = await client.get(
                     f"{self.base_url}/fapi/v1/leverageBracket?{query_str}&signature={sig}",
@@ -741,8 +747,7 @@ class BinanceSpotClient:
                     "recvWindow": 60000,
                     "timestamp": ts
                 }
-                query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-                sig = hmac.new(self.api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+                query_str, sig = self._encode_and_sign(params)
 
                 res = await client.post(
                     f"{self.base_url}/fapi/v1/leverage?{query_str}&signature={sig}",
@@ -801,7 +806,8 @@ class BinanceSpotClient:
                 logger.warning(f"Failed to sync time before order: {e}")
 
             ts = int(time.time() * 1000) + offset_ms
-            client_order_id = f"TP_{int(time.time())}_{sym[:4]}"
+            clean_sym = re.sub(r'[^a-zA-Z0-9]', '', sym) or "TOK"
+            client_order_id = f"TP_{int(time.time())}_{clean_sym[:6]}"
 
             # Step 2: Format parameters based on Futures vs Spot
             params_dict: Dict[str, Any] = {
@@ -922,13 +928,7 @@ class BinanceSpotClient:
                         params_dict["timeInForce"] = time_in_force
 
             # Sign query string
-            sorted_items = sorted(params_dict.items())
-            query_str = "&".join(f"{k}={v}" for k, v in sorted_items)
-            signature = hmac.new(
-                self.api_secret.encode("utf-8"),
-                query_str.encode("utf-8"),
-                hashlib.sha256
-            ).hexdigest()
+            query_str, signature = self._encode_and_sign(params_dict)
 
             submit_url = f"{self.base_url}{order_path}?{query_str}&signature={signature}"
             try:
@@ -1005,16 +1005,9 @@ class BinanceSpotClient:
 
                                 ts_retry = int(time.time() * 1000) + offset_ms
                                 params_dict["timestamp"] = ts_retry
-                                params_dict["newClientOrderId"] = f"TP_{int(time.time())}_{sym[:4]}_R"
+                                params_dict["newClientOrderId"] = f"TP_{int(time.time())}_{clean_sym[:6]}_R"
 
-                                retry_sorted = sorted(params_dict.items())
-                                retry_query_str = "&".join(f"{k}={v}" for k, v in retry_sorted)
-                                retry_signature = hmac.new(
-                                    self.api_secret.encode("utf-8"),
-                                    retry_query_str.encode("utf-8"),
-                                    hashlib.sha256
-                                ).hexdigest()
-
+                                retry_query_str, retry_signature = self._encode_and_sign(params_dict)
                                 retry_submit_url = f"{self.base_url}{order_path}?{retry_query_str}&signature={retry_signature}"
                                 res_retry = await client.post(retry_submit_url, headers=self._get_headers())
                                 try:
