@@ -35,6 +35,7 @@ class AutonomousExecutionService:
             "stop_loss_pct": 5.0,
             "cooldown_minutes": 15,
             "operating_mode": "demo",
+            "leverage": 10,
             "allowed_strategies": ["TOP_PICKS", "BREAKOUT", "VOLUME_SURGE", "DIP_BUY"]
         }
         self.last_trade_time: float = 0.0
@@ -210,11 +211,13 @@ class AutonomousExecutionService:
             if trade_usdt < Decimal("15.0"):
                 trade_usdt = Decimal("25.00")
 
+            auto_lev = int(self.config.get("leverage", 10))
             order_ok, order_data, order_err = await client.place_order(
                 symbol=sym,
                 side="BUY",
                 order_type="MARKET",
-                quote_order_qty=trade_usdt
+                quote_order_qty=trade_usdt,
+                leverage=auto_lev
             )
 
             if not order_ok:

@@ -680,6 +680,91 @@ class BinanceSpotClient:
 
         return round(pnl_24h, 4), round(total_pnl, 4)
 
+    async def get_leverage_brackets(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches leverage brackets from Binance Futures (/fapi/v1/leverageBracket).
+        Returns bracket tiers including initialLeverage, notionalCap, and maintenance margin.
+        """
+        if not self.endpoint_type or (self.endpoint_type == "futures_testnet" and not self.is_futures):
+            await self.get_account_information()
+
+        if not self.is_futures:
+            return []
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                t_res = await client.get(f"{self.base_url}/fapi/v1/time", headers={"User-Agent": "TradePilotAI/1.0.0"})
+                ts = t_res.json().get("serverTime", int(time.time() * 1000)) if t_res.status_code == 200 else int(time.time() * 1000)
+
+                params = {"timestamp": ts, "recvWindow": 60000}
+                if symbol:
+                    params["symbol"] = symbol.upper()
+
+                query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                sig = hmac.new(self.api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+
+                res = await client.get(
+                    f"{self.base_url}/fapi/v1/leverageBracket?{query_str}&signature={sig}",
+                    headers=self._get_headers()
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, list):
+                        return data
+                    elif isinstance(data, dict):
+                        return [data]
+                else:
+                    logger.warning(f"Failed to fetch leverageBracket for {symbol}: {res.status_code} {res.text[:200]}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch leverage brackets from Binance: {e}")
+        return []
+
+    async def set_leverage(self, symbol: str, leverage: int) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        """
+        Sets leverage for a symbol on Binance Futures (/fapi/v1/leverage).
+        """
+        if not self.endpoint_type or (self.endpoint_type == "futures_testnet" and not self.is_futures):
+            await self.get_account_information()
+
+        if not self.is_futures:
+            return False, {}, "Leverage can only be set on Binance Futures accounts"
+
+        sym = symbol.upper()
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                t_res = await client.get(f"{self.base_url}/fapi/v1/time", headers={"User-Agent": "TradePilotAI/1.0.0"})
+                ts = t_res.json().get("serverTime", int(time.time() * 1000)) if t_res.status_code == 200 else int(time.time() * 1000)
+
+                params = {
+                    "symbol": sym,
+                    "leverage": int(leverage),
+                    "recvWindow": 60000,
+                    "timestamp": ts
+                }
+                query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                sig = hmac.new(self.api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+
+                res = await client.post(
+                    f"{self.base_url}/fapi/v1/leverage?{query_str}&signature={sig}",
+                    headers=self._get_headers()
+                )
+                try:
+                    data = res.json()
+                except Exception:
+                    data = {"raw": res.text}
+
+                if res.status_code == 200:
+                    logger.info(f"Successfully adjusted leverage for {sym} to {data.get('leverage')}x (maxNotional: {data.get('maxNotionalValue')})")
+                    return True, data, None
+                else:
+                    err_msg = data.get("msg", str(data))
+                    code = data.get("code")
+                    logger.warning(f"Binance rejected leverage change for {sym}: {code} - {err_msg}")
+                    return False, data, f"Binance rejected leverage ({code}): {err_msg}"
+            except Exception as e:
+                logger.error(f"Error setting leverage for {sym}: {e}")
+                return False, {}, str(e)
+
     async def place_order(
         self,
         symbol: str,
@@ -689,12 +774,13 @@ class BinanceSpotClient:
         quote_order_qty: Optional[Decimal] = None,
         price: Optional[Decimal] = None,
         time_in_force: str = "GTC",
-        reduce_only: bool = False
+        reduce_only: bool = False,
+        leverage: Optional[int] = None
     ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
         """
         Submits an actual order to Binance (Spot or Futures/Mock Trading).
         Automatically formats parameters, applies precision rules, signs with HMAC-SHA256,
-        and synchronizes with Binance server time.
+        pre-validates symbol leverage brackets, and automatically recovers from -2027 leverage errors.
         """
         # Ensure account information / endpoint type is established
         if not self.endpoint_type or (self.endpoint_type == "futures_testnet" and not self.is_futures):
@@ -765,6 +851,29 @@ class BinanceSpotClient:
                 except Exception as e:
                     logger.warning(f"Could not load precision for {sym}: {e}")
 
+                # Pre-emptive leverage verification for Binance Futures
+                max_bracket_notional = Decimal("100000000.0")
+                if not reduce_only:
+                    try:
+                        brackets_data = await self.get_leverage_brackets(sym)
+                        if brackets_data:
+                            sym_b = next((b for b in brackets_data if b.get("symbol") == sym), brackets_data[0] if brackets_data else None)
+                            if sym_b and sym_b.get("brackets"):
+                                tiers = sym_b["brackets"]
+                                max_symbol_lev = max(int(b.get("initialLeverage", 1)) for b in tiers)
+                                max_bracket_notional = Decimal(str(tiers[0].get("notionalCap", "100000000.0")))
+
+                                # Target leverage: user-specified, or safe conservative leverage (e.g. 10x or bounded by symbol max)
+                                chosen_lev = min(leverage if (leverage and leverage > 0) else 10, max_symbol_lev)
+
+                                # If symbol restricts max leverage (e.g. KITEUSDT max is 5x, while account default is 20x),
+                                # or if caller explicitly requested leverage: proactively ensure leverage is valid
+                                if leverage is not None or max_symbol_lev < 20:
+                                    logger.info(f"Pre-emptively setting Binance leverage for {sym} to {chosen_lev}x (symbol max: {max_symbol_lev}x)")
+                                    await self.set_leverage(sym, chosen_lev)
+                    except Exception as lev_err:
+                        logger.warning(f"Could not pre-verify leverage for {sym}: {lev_err}")
+
                 final_qty = max(quantity or Decimal("1.0"), min_qty)
 
                 # Ensure order meets Binance MIN_NOTIONAL requirement when opening new position
@@ -775,6 +884,10 @@ class BinanceSpotClient:
                 # Cap at Binance maximum allowed order quantity
                 if max_qty > Decimal("0"):
                     final_qty = min(final_qty, max_qty)
+
+                # Cap at leverage bracket maximum allowable notional
+                if not reduce_only and cur_p > 0 and max_bracket_notional > Decimal("0") and (final_qty * cur_p) > max_bracket_notional:
+                    final_qty = (max_bracket_notional * Decimal("0.95")) / cur_p
 
                 # Precision rounding: round up to nearest step_size
                 exp = abs(step_size.as_tuple().exponent)
@@ -832,6 +945,94 @@ class BinanceSpotClient:
                     err_msg = data.get("msg", str(data))
                     code = data.get("code")
                     logger.error(f"Binance order rejected: {code} - {err_msg}")
+
+                    # AUTO-RECOVERY for Binance Error -2027 ("Exceeded the maximum allowable position at current leverage")
+                    if self.is_futures and code == -2027 and not reduce_only:
+                        logger.warning(f"Binance rejected {sym} with -2027. Executing automatic leverage and position risk bracket recovery...")
+                        try:
+                            brackets_list = await self.get_leverage_brackets(sym)
+                            sym_bracket = None
+                            for sb in brackets_list:
+                                if sb.get("symbol") == sym:
+                                    sym_bracket = sb
+                                    break
+                            if not sym_bracket and brackets_list:
+                                sym_bracket = brackets_list[0]
+
+                            if sym_bracket and sym_bracket.get("brackets"):
+                                tiers = sym_bracket["brackets"]
+                                max_lev = max(int(b.get("initialLeverage", 1)) for b in tiers)
+                                order_notional = final_qty * cur_p if cur_p > 0 else Decimal("25.0")
+                                target_lev = max_lev
+                                target_cap = Decimal(str(tiers[0].get("notionalCap", "5000")))
+
+                                # Select bracket tier that accommodates the order notional
+                                for tier in tiers:
+                                    tier_cap = Decimal(str(tier.get("notionalCap", "5000")))
+                                    if tier_cap >= order_notional:
+                                        target_lev = int(tier.get("initialLeverage", 1))
+                                        target_cap = tier_cap
+                                        break
+
+                                # Step 1: Set leverage to supported bracket tier
+                                lev_ok, lev_data, lev_err = await self.set_leverage(sym, target_lev)
+                                if not lev_ok and target_lev != max_lev:
+                                    await self.set_leverage(sym, max_lev)
+                                    target_lev = max_lev
+
+                                # Step 2: Ensure order notional does not exceed target_cap
+                                if cur_p > 0 and (final_qty * cur_p) > target_cap:
+                                    final_qty = (target_cap * Decimal("0.90")) / cur_p
+                                    rem = final_qty % step_size
+                                    if rem > 0:
+                                        final_qty = final_qty - rem
+                                    if exp > 0:
+                                        final_qty = round(final_qty, exp)
+                                    else:
+                                        final_qty = int(final_qty)
+                                    if final_qty < min_qty:
+                                        final_qty = min_qty
+                                    params_dict["quantity"] = str(final_qty)
+
+                                # Step 3: Re-sync server time and generate unique newClientOrderId
+                                try:
+                                    t_retry = await client.get(f"{self.base_url}{time_path}", headers={"User-Agent": "TradePilotAI/1.0.0"})
+                                    if t_retry.status_code == 200:
+                                        server_time_retry = t_retry.json().get("serverTime", int(time.time() * 1000))
+                                        offset_ms = server_time_retry - int(time.time() * 1000)
+                                except Exception:
+                                    pass
+
+                                ts_retry = int(time.time() * 1000) + offset_ms
+                                params_dict["timestamp"] = ts_retry
+                                params_dict["newClientOrderId"] = f"TP_{int(time.time())}_{sym[:4]}_R"
+
+                                retry_sorted = sorted(params_dict.items())
+                                retry_query_str = "&".join(f"{k}={v}" for k, v in retry_sorted)
+                                retry_signature = hmac.new(
+                                    self.api_secret.encode("utf-8"),
+                                    retry_query_str.encode("utf-8"),
+                                    hashlib.sha256
+                                ).hexdigest()
+
+                                retry_submit_url = f"{self.base_url}{order_path}?{retry_query_str}&signature={retry_signature}"
+                                res_retry = await client.post(retry_submit_url, headers=self._get_headers())
+                                try:
+                                    retry_json = res_retry.json()
+                                except Exception:
+                                    retry_json = {"raw": res_retry.text}
+
+                                if res_retry.status_code == 200:
+                                    logger.info(f"Binance order successfully recovered on retry for {sym} at {target_lev}x leverage: {retry_json.get('orderId')}")
+                                    return True, retry_json, None
+                                else:
+                                    r_msg = retry_json.get("msg", str(retry_json))
+                                    r_code = retry_json.get("code")
+                                    logger.error(f"Retry order also rejected: {r_code} - {r_msg}")
+                                    return False, retry_json, f"Binance rejected order ({r_code}): {r_msg}. (Auto-adjusted leverage to {target_lev}x with max notional {target_cap} USDT)"
+                        except Exception as rec_exc:
+                            logger.error(f"Auto-recovery failed for {sym}: {rec_exc}")
+
                     return False, data, f"Binance order rejected ({code}): {err_msg}"
             except Exception as e:
                 logger.error(f"Failed to submit order to {submit_url}: {e}")

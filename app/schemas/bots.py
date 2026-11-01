@@ -56,6 +56,7 @@ class ScannerTradeRequest(BaseModel):
     risk_percentage: Decimal = Field(default=Decimal("0.50"), ge=0.01, le=100.0, description="Risk percentage per trade")
     operating_mode: Optional[str] = Field(default="demo", description="Trading mode: demo or live")
     timeframe: Optional[str] = Field(default="15m", description="Trading timeframe")
+    leverage: Optional[int] = Field(default=None, ge=1, le=125, description="Leverage for Binance Futures, e.g. 5, 10, 20")
 
 
 class TradingBotResponse(BaseModel):

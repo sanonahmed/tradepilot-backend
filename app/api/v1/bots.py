@@ -534,11 +534,13 @@ async def create_bot_from_scanner(
 
         new_bot.allocated_budget = trade_amount
 
+        req_leverage = getattr(request, "leverage", None)
         order_ok, order_data, order_err = await binance_client.place_order(
             symbol=sym,
             side="BUY",
             order_type="MARKET",
-            quote_order_qty=trade_amount
+            quote_order_qty=trade_amount,
+            leverage=req_leverage
         )
 
         if not order_ok:
@@ -748,11 +750,13 @@ async def start_bot(
                 trade_amt = Decimal("25.00")
                 if bot.allocated_budget >= Decimal("100.0"):
                     trade_amt = min(bot.allocated_budget * Decimal("0.10"), Decimal("100.00"))
+                bot_lev = params.get("leverage") if params else None
                 order_ok, order_data, order_err = await client.place_order(
                     symbol=bot.symbol,
                     side="BUY",
                     order_type="MARKET",
-                    quote_order_qty=trade_amt
+                    quote_order_qty=trade_amt,
+                    leverage=bot_lev
                 )
                 if order_ok:
                     oid = str(order_data.get("orderId"))
