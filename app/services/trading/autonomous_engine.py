@@ -101,22 +101,22 @@ class AutonomousExecutionService:
         if len(self.decision_logs) > 200:
             self.decision_logs = self.decision_logs[-200:]
 
-    async def run_evaluation_cycle(self) -> Dict[str, Any]:
+    async def run_evaluation_cycle(self, force: bool = False) -> Dict[str, Any]:
         """
         Executes a single autonomous evaluation cycle:
-        1. Checks Auto-Pilot enabled switch.
+        1. Checks Auto-Pilot enabled switch (unless force=True).
         2. Verifies maximum active bot capacity.
-        3. Verifies cooldown window.
+        3. Verifies cooldown window (unless force=True).
         4. Scans for high-conviction setups meeting threshold.
         5. Automatically executes the best opportunity on Binance and launches the bot.
         """
-        if not self.config["enabled"]:
+        if not force and not self.config["enabled"]:
             return {"executed": False, "reason": "Auto-Pilot is currently disabled"}
 
-        # 1. Check cooldown
+        # 1. Check cooldown (bypassed on manual trigger)
         now = time.time()
         cooldown_sec = self.config["cooldown_minutes"] * 60
-        if (now - self.last_trade_time) < cooldown_sec:
+        if not force and (now - self.last_trade_time) < cooldown_sec:
             rem = int(cooldown_sec - (now - self.last_trade_time))
             msg = f"In trade cooldown window ({rem // 60}m {rem % 60}s remaining). Holding execution."
             return {"executed": False, "reason": msg}
@@ -140,8 +140,17 @@ class AutonomousExecutionService:
                 limit=15
             )
             opportunities = scanner_result.get("opportunities", [])
+            if not opportunities and force:
+                # If on-demand execution, fall back to top market setups >= 65
+                scanner_result = await scan_all_market_opportunities(
+                    strategy="ALL",
+                    min_score=65.0,
+                    limit=15
+                )
+                opportunities = scanner_result.get("opportunities", [])
+
             if not opportunities:
-                msg = f"No scanner setups currently satisfy the strict minimum score threshold of {self.config['min_score']}/100."
+                msg = f"No scanner setups currently satisfy the minimum score threshold of {self.config['min_score']}/100."
                 self._add_log("CYCLE_CHECKED", msg, "SCANNING", {"threshold": self.config["min_score"]})
                 return {"executed": False, "reason": msg}
 

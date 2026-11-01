@@ -97,7 +97,7 @@ async def trigger_autonomous_evaluation_now_endpoint(
     Manually trigger an immediate autonomous evaluation cycle to screen
     the whole market and execute high-conviction setups if eligible.
     """
-    res = await autonomous_service.run_evaluation_cycle()
+    res = await autonomous_service.run_evaluation_cycle(force=True)
     status_msg = "Autonomous trade executed successfully" if res.get("executed") else f"Cycle completed: {res.get('reason')}"
     return APIResponse(
         success=True,

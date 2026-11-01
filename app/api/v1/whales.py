@@ -43,7 +43,7 @@ async def get_whale_alerts_endpoint(
     )
 
 
-@router.get("/flow-summary", response_model=APIResponse[List[Dict[str, Any]]])
+@router.get("/flow-summary", response_model=APIResponse[Dict[str, Any]])
 async def get_whale_flow_summary_endpoint(
     current_user: User = Depends(get_current_user)
 ):

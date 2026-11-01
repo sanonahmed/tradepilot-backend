@@ -152,6 +152,7 @@ class NewsService:
                     "sentiment": analysis["sentiment"],
                     "sentiment_score": analysis["sentiment_score"],
                     "urgency": analysis["urgency"],
+                    "tokens": analysis["coins_mentioned"],
                     "coins_mentioned": analysis["coins_mentioned"]
                 })
             return parsed
@@ -222,6 +223,7 @@ class NewsService:
                 "sentiment": analysis["sentiment"],
                 "sentiment_score": analysis["sentiment_score"],
                 "urgency": analysis["urgency"],
+                "tokens": analysis["coins_mentioned"],
                 "coins_mentioned": analysis["coins_mentioned"]
             })
         return result
@@ -242,8 +244,25 @@ class NewsService:
         index = int(50.0 + (bull_pct - bear_pct) * 0.4)
         index = max(10, min(95, index))
         sentiment_label = "EXTREME_GREED" if index >= 75 else ("GREED" if index >= 58 else ("FEAR" if index <= 42 else "NEUTRAL"))
+        normalized_score = round((index - 50.0) / 50.0, 2)
 
+        # Top tokens
+        token_counts: Dict[str, int] = {}
+        for a in articles:
+            for tok in a.get("tokens", []):
+                if tok != "CRYPTO":
+                    token_counts[tok] = token_counts.get(tok, 0) + 1
+
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
         return {
+            "overall_sentiment_score": normalized_score,
+            "market_mood": sentiment_label,
+            "bullish_count": bullish,
+            "bearish_count": bearish,
+            "neutral_count": neutral,
+            "total_articles": total,
+            "top_mentioned_tokens": token_counts,
+            "last_updated": now_str,
             "sentiment_score": index,
             "sentiment_label": sentiment_label,
             "total_headlines_analyzed": total,
@@ -251,7 +270,7 @@ class NewsService:
             "bearish_percentage": bear_pct,
             "neutral_percentage": neu_pct,
             "breaking_alerts_count": len([a for a in articles if a.get("urgency") == "BREAKING"]),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+            "timestamp": now_str
         }
 
 

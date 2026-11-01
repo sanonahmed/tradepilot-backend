@@ -81,8 +81,10 @@ async def test_whale_tracking_and_order_flow():
         res_summary = await client.get("/api/v1/whales/flow-summary", headers=headers)
         assert res_summary.status_code == 200
         summary = res_summary.json()["data"]
-        assert len(summary) >= 1
-        assert "net_inflow_usd" in summary[0]
+        assert "net_whale_flow_usd" in summary
+        assert "buy_ratio_pct" in summary
+        assert "overall_order_flow" in summary
+        assert len(summary.get("pair_flows", [])) >= 1
 
 
 @pytest.mark.asyncio
