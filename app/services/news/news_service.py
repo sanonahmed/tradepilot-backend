@@ -79,8 +79,8 @@ class NewsService:
     ) -> List[Dict[str, Any]]:
         """Retrieves and sentiment-tags live crypto news articles."""
         now = time.time()
-        # 30s live cache for rapid updates without being rate-limited
-        if not self._cached_news or (now - self._last_fetch) > 30.0:
+        # 30-minute cache TTL (1800 seconds) for continuous 30m auto-polling
+        if not self._cached_news or (now - self._last_fetch) > 1800.0:
             articles = await self._fetch_all_feeds()
             if articles:
                 self._cached_news = articles
