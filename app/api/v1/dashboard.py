@@ -307,10 +307,53 @@ async def emergency_kill_switch(
     for ord_obj in open_orders:
         ord_obj.status = "CANCELED"
 
+    # 1. Immediately disable Autonomous Auto-Pilot engine
+    try:
+        from app.services.trading.autonomous_engine import autonomous_service
+        autonomous_service.config["enabled"] = False
+        autonomous_service._add_log(
+            action="EMERGENCY_KILL_SWITCH",
+            message="Auto-Pilot disabled immediately by emergency kill switch.",
+            status="CRITICAL"
+        )
+    except Exception as e:
+        logger.warning(f"Could not disable autonomous service on kill switch: {e}")
+
+    # 2. Cancel open orders on Binance exchange directly
+    binance_canceled_symbols = []
+    try:
+        stmt_conn = select(ExchangeConnection).where(
+            ExchangeConnection.user_id == current_user.id,
+            ExchangeConnection.is_active == True
+        ).order_by(ExchangeConnection.last_synced_at.desc())
+        res_conn = await db.execute(stmt_conn)
+        conn = res_conn.scalars().first()
+        if conn and conn.api_key_encrypted and conn.api_secret_encrypted:
+            plain_key = decrypt_secret(conn.api_key_encrypted)
+            plain_secret = decrypt_secret(conn.api_secret_encrypted)
+            binance_client = BinanceSpotClient(api_key=plain_key, api_secret=plain_secret, is_testnet=conn.is_testnet)
+
+            syms_to_cancel = {b.symbol.upper() for b in active_bots if b.symbol}
+            syms_to_cancel.update({o.symbol.upper() for o in open_orders if o.symbol})
+            for sym in syms_to_cancel:
+                try:
+                    c_ok, _ = await binance_client.cancel_open_orders(sym)
+                    if c_ok:
+                        binance_canceled_symbols.append(sym)
+                except Exception as c_err:
+                    logger.warning(f"Failed to cancel Binance open orders for {sym}: {c_err}")
+    except Exception as b_err:
+        logger.warning(f"Binance emergency order cancellation error: {b_err}")
+
     risk_event = RiskEvent(
         user_id=current_user.id,
         rule_violated="GLOBAL_KILL_SWITCH_TRIGGERED",
-        context_data={"paused_bots": paused_bot_count, "canceled_orders": canceled_order_count},
+        context_data={
+            "paused_bots": paused_bot_count,
+            "canceled_orders": canceled_order_count,
+            "binance_canceled_symbols": binance_canceled_symbols,
+            "autopilot_disabled": True
+        },
         action_taken="KILL_SWITCH"
     )
     db.add(risk_event)
@@ -320,7 +363,12 @@ async def emergency_kill_switch(
         action="EMERGENCY_KILL_SWITCH_ACTIVATED",
         resource_type="RISK",
         resource_id=current_user.id,
-        details={"paused_bots": paused_bot_count, "canceled_orders": canceled_order_count}
+        details={
+            "paused_bots": paused_bot_count,
+            "canceled_orders": canceled_order_count,
+            "binance_canceled_symbols": binance_canceled_symbols,
+            "autopilot_disabled": True
+        }
     )
     db.add(audit)
 
@@ -328,11 +376,13 @@ async def emergency_kill_switch(
 
     return APIResponse(
         success=True,
-        message="EMERGENCY STOP EXECUTED: All active bots paused and open orders canceled.",
+        message=f"EMERGENCY STOP EXECUTED: All active bots paused, Auto-Pilot disabled, and open orders canceled on Binance ({len(binance_canceled_symbols)} symbols cleared).",
         data={
             "kill_switch_active": True,
             "paused_bots": paused_bot_count,
-            "canceled_orders": canceled_order_count
+            "canceled_orders": canceled_order_count,
+            "binance_canceled_symbols": binance_canceled_symbols,
+            "autopilot_disabled": True
         }
     )
 

@@ -1,4 +1,5 @@
 import time
+import re
 import httpx
 import logging
 from decimal import Decimal
@@ -97,8 +98,9 @@ async def fetch_binance_tickers() -> List[TickerPrice]:
                     parsed: List[TickerPrice] = []
                     for item in raw_data:
                         try:
-                            sym = str(item.get("symbol", ""))
-                            if not sym or not sym.endswith("USDT"):
+                            sym = str(item.get("symbol", "")).upper()
+                            # Strict alphanumeric validation: must be uppercase ASCII and end in USDT
+                            if not sym or not sym.endswith("USDT") or not re.match(r'^[A-Z0-9]{2,12}USDT$', sym):
                                 continue
                             last_price = Decimal(str(item.get("lastPrice", "0")))
                             if last_price <= Decimal("0"):

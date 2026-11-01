@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -8,7 +9,7 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 
 from app.core.database import AsyncSessionLocal
-from app.models.entities import TradingBot, BotConfiguration, Order, ExchangeConnection, AuditLog, User
+from app.models.entities import TradingBot, BotConfiguration, Order, ExchangeConnection, AuditLog, User, RiskLimit
 from app.core.security import decrypt_secret
 from app.services.binance.client import BinanceSpotClient
 from app.services.markets.scanner import scan_all_market_opportunities
@@ -122,8 +123,16 @@ class AutonomousExecutionService:
             msg = f"In trade cooldown window ({rem // 60}m {rem % 60}s remaining). Holding execution."
             return {"executed": False, "reason": msg}
 
-        # 2. Check active bots count in database
+        # 2. Check active bots count in database and verify Emergency Kill Switch
         async with AsyncSessionLocal() as session:
+            # Check Global Kill Switch
+            stmt_risk = select(RiskLimit).where(RiskLimit.kill_switch_active == True)
+            res_risk = await session.execute(stmt_risk)
+            if res_risk.scalars().first():
+                msg = "Autonomous execution blocked: Global Emergency Kill Switch is ACTIVE."
+                self._add_log("KILL_SWITCH_BLOCKED", msg, "CRITICAL")
+                return {"executed": False, "reason": msg}
+
             stmt = select(TradingBot).where(TradingBot.status == "active")
             res = await session.execute(stmt)
             active_bots = res.scalars().all()
@@ -163,10 +172,13 @@ class AutonomousExecutionService:
                 self._add_log("CYCLE_CHECKED", msg, "SCANNING", {"threshold": self.config["min_score"]})
                 return {"executed": False, "reason": msg}
 
-            # 4. Filter for opportunities without an existing active bot
+            # 4. Filter for opportunities without an existing active bot (strictly validated ASCII symbols)
             candidate = None
             for opp in opportunities:
                 sym = opp.get("symbol", "").upper()
+                # Strict ASCII token validation: avoids non-ASCII inscriptions (e.g. 牛来USDT) causing -1022 signature rejections
+                if not re.match(r'^[A-Z0-9]{2,12}USDT$', sym):
+                    continue
                 if sym not in active_symbols:
                     candidate = opp
                     break
@@ -206,18 +218,29 @@ class AutonomousExecutionService:
             plain_secret = decrypt_secret(conn.api_secret_encrypted)
             client = BinanceSpotClient(api_key=plain_key, api_secret=plain_secret, is_testnet=conn.is_testnet)
 
-            # Calculate allocation amount
+            # Calculate allocation amount & verify available balance
             eq_ok, eq_data, _ = await client.calculate_real_portfolio_equity()
             total_bal = Decimal("1000.0")
-            if eq_ok and eq_data and eq_data.get("total_equity_usdt"):
-                total_bal = Decimal(str(eq_data["total_equity_usdt"]))
+            avail_usdt = Decimal("0.0")
+            if eq_ok and eq_data:
+                if eq_data.get("total_equity_usdt"):
+                    total_bal = Decimal(str(eq_data["total_equity_usdt"]))
                 if total_bal <= Decimal("0"):
                     total_bal = Decimal(str(eq_data.get("available_balance_usdt", "1000.0")))
+                avail_usdt = Decimal(str(eq_data.get("available_balance_usdt", "0.0")))
+
+            # Pre-flight check: ensure sufficient cash to trade without hitting Binance -2010 (insufficient balance)
+            if avail_usdt > Decimal("0") and avail_usdt < Decimal("10.0") and not force:
+                msg = f"Insufficient available cash (${avail_usdt:.2f} USDT). Holding autonomous trade until margin is freed."
+                self._add_log("INSUFFICIENT_BALANCE", msg, "STANDBY", {"available_usdt": float(avail_usdt)})
+                return {"executed": False, "reason": msg}
 
             trade_alloc_pct = Decimal(str(self.config["capital_allocation_pct"]))
             trade_usdt = round(total_bal * (trade_alloc_pct / Decimal("100.0")), 2)
+            if avail_usdt > Decimal("10.0"):
+                trade_usdt = min(trade_usdt, round(avail_usdt * Decimal("0.90"), 2))
             if trade_usdt < Decimal("15.0"):
-                trade_usdt = Decimal("25.00")
+                trade_usdt = Decimal("20.00")
 
             auto_lev = int(self.config.get("leverage", 10))
             order_ok, order_data, order_err = await client.place_order(
