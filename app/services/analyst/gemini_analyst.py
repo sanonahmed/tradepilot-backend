@@ -52,8 +52,16 @@ def normalize_candidate_symbols(raw_input: str) -> List[str]:
     else:
         # Base coin entered (e.g. "BTC", "SOL", "PEPE", "DOGE", "SHIB", "KITE", "牛来")
         candidates.append(f"{clean}USDT")
-        candidates.append(f"1000{clean}USDT")
-        candidates.append(f"1000000{clean}USDT")
+        if clean.startswith("1000000") and len(clean) > 7:
+            candidates.append(f"{clean[7:]}USDT")
+            candidates.append(clean[7:])
+        elif clean.startswith("1000") and len(clean) > 4:
+            candidates.append(f"{clean[4:]}USDT")
+            candidates.append(clean[4:])
+        else:
+            candidates.append(f"1000{clean}USDT")
+            candidates.append(f"1000000{clean}USDT")
+
         candidates.append(f"{clean}USDC")
         candidates.append(f"{clean}FDUSD")
         candidates.append(f"{clean}BTC")
