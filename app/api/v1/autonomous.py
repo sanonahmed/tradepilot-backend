@@ -37,6 +37,7 @@ async def get_autonomous_config_endpoint(
 
 
 @router.post("/config", response_model=APIResponse[Dict[str, Any]])
+@router.put("/config", response_model=APIResponse[Dict[str, Any]])
 async def update_autonomous_config_endpoint(
     request: AutonomousConfigUpdateRequest,
     current_user: User = Depends(get_current_user)
