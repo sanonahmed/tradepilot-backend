@@ -41,5 +41,14 @@ class AnalyticsSummaryResponse(BaseModel):
     sharpe_ratio: Decimal
     max_drawdown_pct: Decimal
     active_positions: int
+    portfolio_equity_usdt: Decimal = Decimal("0.0")
+    available_balance_usdt: Decimal = Decimal("0.0")
+    allocated_balance_usdt: Decimal = Decimal("0.0")
+    unrealized_pnl_usdt: Decimal = Decimal("0.0")
+    daily_pnl_24h_usdt: Decimal = Decimal("0.0")
+    connection_mode: str = "Binance Demo"
+    is_connected: bool = True
+    last_sync_time: str = ""
+    venue: str = "Binance Spot"
 
     model_config = ConfigDict(from_attributes=True)
