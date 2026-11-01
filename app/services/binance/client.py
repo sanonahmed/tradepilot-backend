@@ -65,6 +65,7 @@ class BinanceSpotClient:
     Supports Spot & Futures (Binance Global, US, Spot Testnet, and Futures Testnet / Mock Trading).
     Enforces HMAC-SHA256 request signing, 60s recvWindow, and automatic endpoint resolution.
     """
+    _CACHED_WORKING_ENDPOINT: Dict[str, Tuple[str, str, str, str, bool, bool]] = {}
 
     def __init__(self, api_key: str = "", api_secret: str = "", is_testnet: bool = True):
         # Sanitize keys: strip whitespace, newlines, and surrounding quotes
@@ -77,6 +78,14 @@ class BinanceSpotClient:
             "https://testnet.binancefuture.com" if is_testnet else "https://api.binance.com"
         )
         self._time_offset_ms: int = 0
+
+        # Load previously verified working endpoint from memory cache
+        if self.api_key and self.api_key in BinanceSpotClient._CACHED_WORKING_ENDPOINT:
+            cached = BinanceSpotClient._CACHED_WORKING_ENDPOINT[self.api_key]
+            self.endpoint_type = cached[0]
+            self.base_url = cached[1]
+            self.is_futures = cached[4]
+            self.is_testnet = cached[5]
 
     def _get_headers(self) -> Dict[str, str]:
         headers = {
@@ -95,7 +104,7 @@ class BinanceSpotClient:
     ) -> Tuple[int, Any]:
         """Attempts an account query against a specific Binance base URL with server time sync."""
         offset_ms = 0
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=3.5) as client:
             try:
                 time_url = f"{base_url}{time_path}"
                 t_res = await client.get(time_url, headers={"User-Agent": "TradePilotAI/1.0.0"})
@@ -202,6 +211,12 @@ class BinanceSpotClient:
                 ("spot_testnet", "https://testnet.binance.vision", "/api/v3/account", "/api/v3/time", False, True),
             ]
 
+        # Prioritize cached working endpoint for this API key if known
+        if self.api_key and self.api_key in BinanceSpotClient._CACHED_WORKING_ENDPOINT:
+            cached_c = BinanceSpotClient._CACHED_WORKING_ENDPOINT[self.api_key]
+            candidates = [c for c in candidates if c[0] != cached_c[0]]
+            candidates.insert(0, cached_c)
+
         last_status = 0
         last_data: Any = {}
         tried_urls = []
@@ -214,6 +229,8 @@ class BinanceSpotClient:
                 self.base_url = url
                 self.is_futures = is_fut
                 self.is_testnet = is_test
+                if self.api_key:
+                    BinanceSpotClient._CACHED_WORKING_ENDPOINT[self.api_key] = (name, url, acct_path, time_path, is_fut, is_test)
                 logger.info(f"Connected to Binance endpoint: {name} ({url})")
 
                 # If live spot and withdrawal permission is enabled, enforce security block
