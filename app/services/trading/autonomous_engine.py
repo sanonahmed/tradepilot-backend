@@ -130,7 +130,7 @@ class AutonomousExecutionService:
             active_symbols = {b.symbol for b in active_bots}
 
             if len(active_bots) >= self.config["max_active_bots"]:
-                msg = f"Capacity full: {len(active_bots)}/{self.config['max_active_bots']} maximum simultaneous bots are already active."
+                msg = f"Auto-Pilot capacity reached: {len(active_bots)}/{self.config['max_active_bots']} maximum simultaneous bots are already active. Please stop an existing bot or increase max bots to execute another trade."
                 self._add_log("CYCLE_SKIPPED", msg, "STANDBY", {"active_count": len(active_bots)})
                 return {"executed": False, "reason": msg}
 
@@ -138,15 +138,23 @@ class AutonomousExecutionService:
             scanner_result = await scan_all_market_opportunities(
                 strategy="ALL",
                 min_score=float(self.config["min_score"]),
-                limit=15
+                limit=35
             )
             opportunities = scanner_result.get("opportunities", [])
             if not opportunities and force:
-                # If on-demand execution, fall back to top market setups >= 65
+                # If on-demand execution, progressively lower threshold to locate viable market setups
                 scanner_result = await scan_all_market_opportunities(
                     strategy="ALL",
-                    min_score=65.0,
-                    limit=15
+                    min_score=60.0,
+                    limit=35
+                )
+                opportunities = scanner_result.get("opportunities", [])
+
+            if not opportunities and force:
+                scanner_result = await scan_all_market_opportunities(
+                    strategy="ALL",
+                    min_score=40.0,
+                    limit=35
                 )
                 opportunities = scanner_result.get("opportunities", [])
 
@@ -164,7 +172,7 @@ class AutonomousExecutionService:
                     break
 
             if not candidate:
-                msg = "Top opportunities already have active tracking bots running. Holding to prevent duplicate exposure."
+                msg = f"All {len(opportunities)} screened opportunities already have active tracking bots running. Holding to prevent duplicate exposure."
                 self._add_log("CYCLE_SKIPPED", msg, "STANDBY")
                 return {"executed": False, "reason": msg}
 
