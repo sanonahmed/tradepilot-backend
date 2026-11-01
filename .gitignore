@@ -15,6 +15,7 @@ __pycache__/
 *.sqlite
 *.sqlite3
 *.log
+autonomous_config.json
 
 # Environment variables
 .env

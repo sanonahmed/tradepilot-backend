@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -16,6 +18,7 @@ from app.services.markets.scanner import scan_all_market_opportunities
 
 logger = logging.getLogger("tradepilot.autonomous")
 
+PERSISTENCE_FILE = Path(__file__).resolve().parents[3] / "autonomous_config.json"
 _autonomous_loop_running = False
 
 
@@ -49,6 +52,40 @@ class AutonomousExecutionService:
                 "status": "STANDBY"
             }
         ]
+        self._load_persisted_state()
+
+    def _load_persisted_state(self):
+        """Restores autonomous configuration, last trade time, and decision logs from disk."""
+        try:
+            if PERSISTENCE_FILE.exists():
+                with open(PERSISTENCE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    saved_cfg = data.get("config", {})
+                    if isinstance(saved_cfg, dict):
+                        self.config.update(saved_cfg)
+                    if "last_trade_time" in data:
+                        self.last_trade_time = float(data["last_trade_time"])
+                    if "decision_logs" in data and isinstance(data["decision_logs"], list) and data["decision_logs"]:
+                        self.decision_logs = data["decision_logs"][-100:]
+                logger.info(f"Loaded persistent Auto-Pilot state from {PERSISTENCE_FILE}: enabled={self.config.get('enabled')}, min_score={self.config.get('min_score')}")
+        except Exception as e:
+            logger.warning(f"Could not load autonomous persistence state: {e}")
+
+    def _save_persisted_state(self):
+        """Atomically persists autonomous parameters and decision logs to disk."""
+        try:
+            payload = {
+                "config": self.config,
+                "last_trade_time": self.last_trade_time,
+                "decision_logs": self.decision_logs[-50:],
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            PERSISTENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(PERSISTENCE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to persist autonomous configuration to disk: {e}")
 
     def get_config(self) -> Dict[str, Any]:
         """Returns current autonomous engine parameters and operational status."""
@@ -72,6 +109,7 @@ class AutonomousExecutionService:
             message=f"Auto-Pilot parameters updated: Min Score={self.config['min_score']}, Max Bots={self.config['max_active_bots']}, Alloc={self.config['capital_allocation_pct']}%",
             status="INFO"
         )
+        self._save_persisted_state()
         return self.get_config()
 
     def toggle_autopilot(self) -> Dict[str, Any]:
@@ -83,6 +121,7 @@ class AutonomousExecutionService:
             message=f"Auto-Pilot Autonomous Mode was {st.lower()} by user. Scanner scanning target pairs.",
             status="SUCCESS" if self.config["enabled"] else "PAUSED"
         )
+        self._save_persisted_state()
         return self.get_config()
 
     def get_logs(self, limit: int = 40) -> List[Dict[str, Any]]:
@@ -102,6 +141,8 @@ class AutonomousExecutionService:
         self.decision_logs.append(log_entry)
         if len(self.decision_logs) > 200:
             self.decision_logs = self.decision_logs[-200:]
+        if status in ["SUCCESS", "FAILED", "CRITICAL"]:
+            self._save_persisted_state()
 
     async def run_evaluation_cycle(self, force: bool = False) -> Dict[str, Any]:
         """
@@ -172,16 +213,40 @@ class AutonomousExecutionService:
                 self._add_log("CYCLE_CHECKED", msg, "SCANNING", {"threshold": self.config["min_score"]})
                 return {"executed": False, "reason": msg}
 
-            # 4. Filter for opportunities without an existing active bot (strictly validated ASCII symbols)
+            # 4. Filter for opportunities without an existing active bot (strictly validated ASCII symbols with 15m K-line pre-flight confirmation)
             candidate = None
             for opp in opportunities:
                 sym = opp.get("symbol", "").upper()
                 # Strict ASCII token validation: avoids non-ASCII inscriptions (e.g. 牛来USDT) causing -1022 signature rejections
                 if not re.match(r'^[A-Z0-9]{2,12}USDT$', sym):
                     continue
-                if sym not in active_symbols:
-                    candidate = opp
-                    break
+                if sym in active_symbols:
+                    continue
+
+                # UPGRADE: 15-Minute Real K-Line Multi-Indicator Pre-Flight Verification
+                try:
+                    from app.services.analyst.gemini_analyst import gemini_analyst_service
+                    tech = await gemini_analyst_service.fetch_technical_indicators(sym, timeframe="15m")
+                    if tech:
+                        real_rsi = float(tech.get("rsi_14", 50.0))
+                        # Rule A: Do not buy if real 15m RSI is overbought (> 72.0)
+                        if real_rsi > 72.0:
+                            logger.info(f"Pre-flight skipped candidate {sym}: 15m RSI is overextended at {real_rsi:.1f} > 72.0")
+                            continue
+                        # Rule B: Do not buy if real 15m RSI is collapsing (< 35.0 and falling)
+                        if real_rsi < 35.0 and float(tech.get("price_change_pct", 0.0)) < -2.0:
+                            logger.info(f"Pre-flight skipped candidate {sym}: Falling knife with RSI {real_rsi:.1f}")
+                            continue
+
+                        # Attach verified K-line data into candidate
+                        opp["real_rsi"] = real_rsi
+                        opp["support_levels"] = tech.get("support_levels", [0, 0])
+                        opp["resistance_levels"] = tech.get("resistance_levels", [0, 0])
+                except Exception as k_err:
+                    logger.debug(f"K-line pre-flight check bypassed for {sym}: {k_err}")
+
+                candidate = opp
+                break
 
             if not candidate:
                 msg = f"All {len(opportunities)} screened opportunities already have active tracking bots running. Holding to prevent duplicate exposure."
@@ -242,7 +307,18 @@ class AutonomousExecutionService:
             if trade_usdt < Decimal("15.0"):
                 trade_usdt = Decimal("20.00")
 
+            # UPGRADE: Check Market Whale Delta to protect against institutional dumps
             auto_lev = int(self.config.get("leverage", 10))
+            try:
+                from app.services.whales.whale_tracker import whale_tracker_service
+                w_summary = await whale_tracker_service.get_whale_flow_summary()
+                net_whale_delta = float(w_summary.get("net_whale_delta_usd", 0.0))
+                if net_whale_delta < -3000000.0:  # > $3M institutional net selling
+                    logger.warning(f"Market-wide net whale dump detected (${net_whale_delta:,.0f}). Reducing leverage to 5x.")
+                    auto_lev = min(auto_lev, 5)
+            except Exception:
+                pass
+
             order_ok, order_data, order_err = await client.place_order(
                 symbol=sym,
                 side="BUY",
@@ -267,6 +343,22 @@ class AutonomousExecutionService:
             sl_pct = Decimal(str(self.config["stop_loss_pct"]))
             tp_price = round(fill_p * (Decimal("1.0") + tp_pct / Decimal("100.0")), 6)
             sl_price = round(fill_p * (Decimal("1.0") - sl_pct / Decimal("100.0")), 6)
+
+            # UPGRADE: Place Native Binance STOP_MARKET Order for Server-Side Crash Protection
+            native_sl_id = None
+            if client.is_futures and exec_q > Decimal("0") and sl_price > Decimal("0"):
+                try:
+                    sl_ok, sl_data, sl_err = await client.place_stop_market_order(
+                        symbol=sym,
+                        side="SELL",
+                        quantity=exec_q,
+                        stop_price=sl_price
+                    )
+                    if sl_ok and sl_data:
+                        native_sl_id = str(sl_data.get("orderId"))
+                        logger.info(f"⚡ Server-side Binance STOP_MARKET placed for {sym} at ${sl_price} (Order #{native_sl_id})")
+                except Exception as sl_exc:
+                    logger.warning(f"Could not place native STOP_MARKET for {sym}: {sl_exc}")
 
             # Create Bot in Database
             new_bot = TradingBot(
@@ -298,6 +390,7 @@ class AutonomousExecutionService:
                     "opportunity_score": float(score),
                     "signal_type": sig_type,
                     "binance_order_id": order_id,
+                    "native_sl_order_id": native_sl_id,
                     "binance_status": "FILLED",
                     "binance_executed": True,
                     "exchange_endpoint": client.endpoint_type,
@@ -307,7 +400,9 @@ class AutonomousExecutionService:
                     "take_profit_pct": float(tp_pct),
                     "stop_loss_pct": float(sl_pct),
                     "executed_quantity": float(exec_q if exec_q > 0 else 1.0),
-                    "allocated_trade_usdt": float(trade_usdt)
+                    "allocated_trade_usdt": float(trade_usdt),
+                    "break_even_locked": False,
+                    "trailing_active": False
                 }
             )
             session.add(bot_config)

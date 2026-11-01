@@ -1030,3 +1030,64 @@ class BinanceSpotClient:
             except Exception as e:
                 logger.error(f"Failed to submit order to {submit_url}: {e}")
                 return False, {}, f"Network error submitting order to Binance: {str(e)}"
+
+    async def place_stop_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        stop_price: Decimal
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Places a native STOP_MARKET conditional order directly on Binance matching engine.
+        Tokyo/AWS matching engine triggers closure in 2ms even if TradePilot is offline.
+        """
+        if not self.endpoint_type or (self.endpoint_type == "futures_testnet" and not self.is_futures):
+            await self.get_account_information()
+
+        if not self.is_futures:
+            return False, None, "STOP_MARKET conditional orders only supported on Futures"
+
+        sym = symbol.upper()
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                time_path = "/fapi/v1/time"
+                offset_ms = 0
+                try:
+                    t_res = await client.get(f"{self.base_url}{time_path}", headers={"User-Agent": "TradePilotAI/1.0.0"})
+                    if t_res.status_code == 200:
+                        server_time = t_res.json().get("serverTime", int(time.time() * 1000))
+                        offset_ms = server_time - int(time.time() * 1000)
+                except Exception:
+                    pass
+
+                ts = int(time.time() * 1000) + offset_ms
+                clean_sym = re.sub(r'[^a-zA-Z0-9]', '', sym) or "TOK"
+                client_order_id = f"TP_SL_{int(time.time())}_{clean_sym[:6]}"
+
+                params_dict: Dict[str, Any] = {
+                    "symbol": sym,
+                    "side": side.upper(),
+                    "type": "STOP_MARKET",
+                    "stopPrice": str(round(stop_price, 6)),
+                    "quantity": str(quantity),
+                    "reduceOnly": "true",
+                    "newClientOrderId": client_order_id,
+                    "recvWindow": 60000,
+                    "timestamp": ts
+                }
+
+                query_str, signature = self._encode_and_sign(params_dict)
+                submit_url = f"{self.base_url}/fapi/v1/order?{query_str}&signature={signature}"
+                res = await client.post(submit_url, headers=self._get_headers())
+                data = res.json() if res.headers.get("content-type", "").startswith("application/json") else {"raw": res.text}
+                if res.status_code == 200:
+                    logger.info(f"Native Binance STOP_MARKET order placed for {sym} at ${stop_price}: {data.get('orderId')}")
+                    return True, data, None
+                else:
+                    err_msg = data.get("msg", str(data))
+                    logger.warning(f"Binance rejected native STOP_MARKET for {sym}: {err_msg}")
+                    return False, data, err_msg
+            except Exception as e:
+                logger.warning(f"Exception submitting native STOP_MARKET for {sym}: {e}")
+                return False, None, str(e)

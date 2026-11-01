@@ -322,10 +322,10 @@ async def run_exit_monitor_cycle():
 
                 tp_pct = Decimal(str(params.get("take_profit_pct", "10.00")))
                 sl_pct = Decimal(str(params.get("stop_loss_pct", "5.00")))
+                initial_sl_price = round(entry_price * (Decimal("1.0") - sl_pct / Decimal("100.0")), 6)
                 tp_price = round(entry_price * (Decimal("1.0") + tp_pct / Decimal("100.0")), 6)
-                sl_price = round(entry_price * (Decimal("1.0") - sl_pct / Decimal("100.0")), 6)
                 params["take_profit_price"] = float(tp_price)
-                params["stop_loss_price"] = float(sl_price)
+                params["initial_stop_loss_price"] = float(initial_sl_price)
 
                 # Query current ticker price if not already resolved from position details
                 if cur_price is None or cur_price <= Decimal("0"):
@@ -337,7 +337,35 @@ async def run_exit_monitor_cycle():
                 # Calculate PnL %
                 pnl_pct = ((cur_price - entry_price) / entry_price) * Decimal("100.0")
 
-                # Update current status
+                # Track highest price and highest unrealized PnL reached
+                highest_pnl = Decimal(str(params.get("highest_pnl_pct", "0.0")))
+                if pnl_pct > highest_pnl:
+                    highest_pnl = pnl_pct
+                    params["highest_pnl_pct"] = float(round(highest_pnl, 2))
+                    params["highest_price"] = float(cur_price)
+
+                # UPGRADE 1: DYNAMIC BREAK-EVEN LOCK (+3.0% threshold)
+                # Automatically shifts Stop Loss to Entry + 0.3% (covers exchange fees) so winning trades never turn into losses
+                break_even_price = round(entry_price * Decimal("1.003"), 6)
+                effective_sl_price = initial_sl_price
+
+                if highest_pnl >= Decimal("3.0") or pnl_pct >= Decimal("3.0"):
+                    if not params.get("break_even_locked"):
+                        params["break_even_locked"] = True
+                        logger.info(f"🛡️ BREAK-EVEN ACTIVATED for {bot.name} ({sym})! PnL reached +{pnl_pct:.2f}%. Stop Loss raised to Entry Price (${break_even_price}).")
+                    effective_sl_price = max(effective_sl_price, break_even_price)
+
+                # UPGRADE 2: DYNAMIC TRAILING PROFIT LOCK (+6.0% threshold)
+                # Trails peak price with a 2.0% cushion to lock in gains if a breakout begins to exhaust
+                if highest_pnl >= Decimal("6.0"):
+                    peak_p = Decimal(str(params.get("highest_price", cur_price)))
+                    trailing_sl = round(peak_p * Decimal("0.98"), 6)
+                    if trailing_sl > effective_sl_price:
+                        effective_sl_price = trailing_sl
+                        params["trailing_sl_price"] = float(trailing_sl)
+                        params["trailing_active"] = True
+
+                params["stop_loss_price"] = float(effective_sl_price)
                 params["current_price"] = float(cur_price)
                 params["current_pnl_pct"] = float(round(pnl_pct, 2))
                 config.strategy_params = params
@@ -350,14 +378,27 @@ async def run_exit_monitor_cycle():
                     await close_bot_position(bot.id, reason, db=session)
                     continue
 
-                # Stabilization Cooldown: Don't trigger Stop Loss during the first 15 seconds of a trade!
-                # Prevents premature stop-out from immediate market spread or fill slippage.
-                if age_seconds < 15.0:
+                # Stabilization Cooldown: Don't trigger initial Stop Loss during the first 15 seconds of a trade
+                if age_seconds < 15.0 and not params.get("break_even_locked") and not params.get("trailing_active"):
                     logger.debug(f"Bot {bot.name} ({sym}) in 15s entry cooldown ({age_seconds:.1f}s), holding SL trigger.")
                     continue
 
-                # Check Stop Loss trigger (-5%)
-                if (cur_price <= sl_price or pnl_pct <= -sl_pct) and cur_price > Decimal("0") and sl_price > Decimal("0"):
+                # Check Trailing Profit Lock trigger
+                if params.get("trailing_active") and cur_price <= effective_sl_price:
+                    logger.info(f"✨ TRAILING PROFIT LOCK TRIGGERED for {bot.name} ({sym})! Peak: +{highest_pnl:.2f}%, Exit: +{pnl_pct:.2f}% at ${cur_price}")
+                    reason = f"TRAILING_PROFIT_TRIGGERED (Locked in +{pnl_pct:.2f}% profit after peak of +{highest_pnl:.2f}%)"
+                    await close_bot_position(bot.id, reason, db=session)
+                    continue
+
+                # Check Break-Even trigger
+                if params.get("break_even_locked") and cur_price <= effective_sl_price:
+                    logger.info(f"🛡️ BREAK-EVEN EXIT TRIGGERED for {bot.name} ({sym})! Position protected from loss at ${cur_price} (PnL: +{pnl_pct:.2f}%)")
+                    reason = f"BREAK_EVEN_EXIT (Position protected from loss at +{pnl_pct:.2f}%)"
+                    await close_bot_position(bot.id, reason, db=session)
+                    continue
+
+                # Check Standard Stop Loss trigger
+                if (cur_price <= effective_sl_price or pnl_pct <= -sl_pct) and cur_price > Decimal("0") and effective_sl_price > Decimal("0"):
                     logger.warning(f"🛑 STOP LOSS TRIGGERED for {bot.name} ({sym})! Current: ${cur_price} vs Entry: ${entry_price} (PnL: {pnl_pct:.2f}%)")
                     reason = f"STOP_LOSS_TRIGGERED ({pnl_pct:.2f}% Loss Protection Activated)"
                     await close_bot_position(bot.id, reason, db=session)
