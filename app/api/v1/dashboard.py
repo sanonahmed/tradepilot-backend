@@ -144,9 +144,24 @@ async def get_dashboard_summary(
                     live_positions_details = await client.get_live_positions_details()
                     open_pos = {s: p["position_amt"] for s, p in live_positions_details.items()}
                     cleaned_active = []
+                    now_utc = datetime.now(timezone.utc)
                     for b in active_bots:
                         cfg = b.configuration
                         params = cfg.strategy_params if (cfg and cfg.strategy_params) else {}
+                        
+                        # Grace period: do not mark brand new bots completed while Binance settles
+                        bot_created = b.created_at
+                        if bot_created:
+                            if bot_created.tzinfo is None:
+                                bot_created = bot_created.replace(tzinfo=timezone.utc)
+                            age_sec = (now_utc - bot_created).total_seconds()
+                        else:
+                            age_sec = 999999.0
+
+                        if age_sec < 60.0:
+                            cleaned_active.append(b)
+                            continue
+
                         if not params.get("binance_executed") or b.symbol not in open_pos:
                             b.status = "completed"
                             db.add(b)

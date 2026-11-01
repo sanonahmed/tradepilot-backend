@@ -717,13 +717,14 @@ class BinanceSpotClient:
                     if p_res.status_code == 200:
                         cur_p = Decimal(str(p_res.json().get("price", "1.0")))
                         if quantity is None and quote_order_qty is not None and cur_p > 0:
-                            quantity = quote_order_qty / cur_p
+                            quantity = Decimal(str(quote_order_qty)) / cur_p
                 except Exception as p_err:
                     logger.warning(f"Failed to fetch price for {sym}: {p_err}")
 
                 # Fetch symbol LOT_SIZE and MIN_NOTIONAL precision
                 step_size = Decimal("0.001")
                 min_qty = Decimal("0.001")
+                max_qty = Decimal("1000000000.0")
                 min_notional = Decimal("5.0")
                 try:
                     ei_res = await client.get(f"{self.base_url}/fapi/v1/exchangeInfo")
@@ -734,6 +735,13 @@ class BinanceSpotClient:
                             if lot_f:
                                 step_size = Decimal(str(lot_f.get("stepSize", "0.001")))
                                 min_qty = Decimal(str(lot_f.get("minQty", "0.001")))
+                                if lot_f.get("maxQty"):
+                                    max_qty = Decimal(str(lot_f["maxQty"]))
+                            market_lot_f = next((f for f in s_info.get("filters", []) if f.get("filterType") == "MARKET_LOT_SIZE"), None)
+                            if market_lot_f and market_lot_f.get("maxQty"):
+                                market_max = Decimal(str(market_lot_f["maxQty"]))
+                                if market_max > Decimal("0"):
+                                    max_qty = min(max_qty, market_max)
                             notional_f = next((f for f in s_info.get("filters", []) if f.get("filterType") == "MIN_NOTIONAL"), None)
                             if notional_f:
                                 min_notional = Decimal(str(notional_f.get("notional", "5.0")))
@@ -746,6 +754,10 @@ class BinanceSpotClient:
                 if not reduce_only and cur_p > 0 and (final_qty * cur_p) < min_notional:
                     needed_qty = (min_notional / cur_p) * Decimal("1.05")
                     final_qty = max(final_qty, needed_qty)
+
+                # Cap at Binance maximum allowed order quantity
+                if max_qty > Decimal("0"):
+                    final_qty = min(final_qty, max_qty)
 
                 # Precision rounding: round up to nearest step_size
                 exp = abs(step_size.as_tuple().exponent)

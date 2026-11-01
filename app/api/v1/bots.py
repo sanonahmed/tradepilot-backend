@@ -223,6 +223,7 @@ async def list_bots(
 
     # Sync any bots whose trade has been closed on Binance
     has_changes = False
+    now_utc = datetime.now(timezone.utc)
     for bot in all_bots:
         config = bot.configuration
         params = config.strategy_params if (config and config.strategy_params) else {}
@@ -232,20 +233,40 @@ async def list_bots(
                 bot.status = "stopped"
                 has_changes = True
                 continue
+
+            # Calculate bot age for opening grace period
+            bot_created = bot.created_at
+            if bot_created:
+                if bot_created.tzinfo is None:
+                    bot_created = bot_created.replace(tzinfo=timezone.utc)
+                age_sec = (now_utc - bot_created).total_seconds()
+            else:
+                age_sec = 999999.0
+
             # If we fetched positions from Binance and the symbol is NOT open on Binance:
             if live_positions_details is not None and bot.symbol not in open_binance_positions:
-                bot.status = "completed"
-                params["exit_reason"] = "CLOSED_ON_BINANCE"
-                params["exit_at"] = datetime.now(timezone.utc).isoformat()
-                config.strategy_params = params
-                has_changes = True
+                # 60s Opening Grace Period: Never archive brand new bots while Binance fills/indexes the position
+                if age_sec >= 60.0:
+                    bot.status = "completed"
+                    params["exit_reason"] = "CLOSED_ON_BINANCE"
+                    params["exit_at"] = datetime.now(timezone.utc).isoformat()
+                    config.strategy_params = params
+                    has_changes = True
             elif bot.symbol in live_positions_details:
                 # Update bot configuration with exact official entry and mark prices from Binance
                 bp = live_positions_details[bot.symbol]
                 if bp.get("entry_price") and bp["entry_price"] > Decimal("0"):
-                    params["entry_price"] = float(bp["entry_price"])
+                    real_entry = bp["entry_price"]
+                    params["entry_price"] = float(real_entry)
+                    tp_pct = Decimal(str(params.get("take_profit_pct", "10.0")))
+                    sl_pct = Decimal(str(params.get("stop_loss_pct", "5.0")))
+                    params["take_profit_price"] = float(round(real_entry * (Decimal("1.0") + tp_pct / Decimal("100.0")), 6))
+                    params["stop_loss_price"] = float(round(real_entry * (Decimal("1.0") - sl_pct / Decimal("100.0")), 6))
                 if bp.get("mark_price") and bp["mark_price"] > Decimal("0"):
                     params["current_price"] = float(bp["mark_price"])
+                    if bp.get("entry_price") and bp["entry_price"] > Decimal("0"):
+                        pnl = ((bp["mark_price"] - bp["entry_price"]) / bp["entry_price"]) * Decimal("100.0")
+                        params["current_pnl_pct"] = float(round(pnl, 2))
                 if bp.get("position_amt"):
                     params["executed_quantity"] = float(abs(bp["position_amt"]))
                 config.strategy_params = params
@@ -443,7 +464,7 @@ async def create_bot_from_scanner(
         ExchangeConnection.is_active == True
     )
     result_conn = await db.execute(stmt_conn)
-    conn = result_conn.scalar_one_or_none()
+    conn = result_conn.scalars().first()
 
     # Fallback to any active Binance connection in the database if user id differs
     if not conn:
@@ -452,7 +473,7 @@ async def create_bot_from_scanner(
             ExchangeConnection.is_active == True
         ).order_by(ExchangeConnection.last_synced_at.desc())
         result_any = await db.execute(stmt_any)
-        conn = result_any.scalar_one_or_none()
+        conn = result_any.scalars().first()
 
     if not conn or not conn.api_key_encrypted or not conn.api_secret_encrypted:
         raise HTTPException(
@@ -529,16 +550,33 @@ async def create_bot_from_scanner(
         binance_order_id = str(order_data.get("orderId"))
         binance_status = str(order_data.get("status", "FILLED"))
 
-        # Calculate fill price, take profit target price (+10%), and stop loss price (-5%)
-        fill_price = Decimal(str(order_data.get("price", "0")))
-        if fill_price <= Decimal("0") and request.entry_price:
+        # Calculate exact fill price from Binance execution (Futures avgPrice, Spot fills, or quote/qty ratio)
+        avg_p = Decimal(str(order_data.get("avgPrice", "0")))
+        p_raw = Decimal(str(order_data.get("price", "0")))
+        exec_qty = Decimal(str(order_data.get("executedQty", order_data.get("origQty", "0"))))
+        cum_quote = Decimal(str(order_data.get("cumQuote", order_data.get("cummulativeQuoteQty", "0"))))
+        fills = order_data.get("fills", [])
+
+        fill_price = Decimal("0")
+        if avg_p > Decimal("0"):
+            fill_price = avg_p
+        elif p_raw > Decimal("0"):
+            fill_price = p_raw
+        elif exec_qty > Decimal("0") and cum_quote > Decimal("0"):
+            fill_price = cum_quote / exec_qty
+        elif fills and isinstance(fills, list) and len(fills) > 0:
+            fill_price = Decimal(str(fills[0].get("price", "0")))
+        elif request.entry_price and request.entry_price > Decimal("0"):
             fill_price = request.entry_price
+        
         if fill_price <= Decimal("0"):
             fill_price = Decimal("1.0")
 
+        if exec_qty <= Decimal("0"):
+            exec_qty = Decimal(str(order_data.get("origQty", "1.0")))
+
         tp_price = round(fill_price * (Decimal("1.0") + tp_pct / Decimal("100.0")), 6)
         sl_price = round(fill_price * (Decimal("1.0") - sl_pct / Decimal("100.0")), 6)
-        exec_qty = Decimal(str(order_data.get("origQty", order_data.get("executedQty", "1.0"))))
 
         strategy_params["binance_order_id"] = binance_order_id
         strategy_params["binance_status"] = binance_status
@@ -693,14 +731,14 @@ async def start_bot(
             ExchangeConnection.is_active == True
         )
         res_conn = await db.execute(stmt_conn)
-        conn = res_conn.scalar_one_or_none()
+        conn = res_conn.scalars().first()
         if not conn:
             stmt_any = select(ExchangeConnection).where(
                 ExchangeConnection.exchange == "binance",
                 ExchangeConnection.is_active == True
             ).order_by(ExchangeConnection.last_synced_at.desc())
             res_any = await db.execute(stmt_any)
-            conn = res_any.scalar_one_or_none()
+            conn = res_any.scalars().first()
 
         if conn and conn.api_key_encrypted and conn.api_secret_encrypted:
             try:
@@ -718,10 +756,18 @@ async def start_bot(
                 )
                 if order_ok:
                     oid = str(order_data.get("orderId"))
+                    avg_p = Decimal(str(order_data.get("avgPrice", "0")))
+                    p_raw = Decimal(str(order_data.get("price", "0")))
+                    exec_q = Decimal(str(order_data.get("executedQty", order_data.get("origQty", "0"))))
+                    cum_q = Decimal(str(order_data.get("cumQuote", order_data.get("cummulativeQuoteQty", "0"))))
+                    f_price = avg_p if avg_p > 0 else (p_raw if p_raw > 0 else ((cum_q / exec_q) if exec_q > 0 and cum_q > 0 else Decimal("0")))
+
                     params["binance_order_id"] = oid
                     params["binance_status"] = str(order_data.get("status", "FILLED"))
                     params["binance_executed"] = True
                     params["exchange_endpoint"] = client.endpoint_type
+                    if f_price > 0:
+                        params["entry_price"] = float(f_price)
                     if config:
                         config.strategy_params = params
                     new_order = Order(
@@ -734,10 +780,10 @@ async def start_bot(
                         order_type="MARKET",
                         mode="live" if not conn.is_testnet else "demo",
                         status=params["binance_status"],
-                        price=Decimal(str(order_data.get("price", "0"))),
+                        price=f_price if f_price > 0 else Decimal(str(order_data.get("price", "0"))),
                         quantity=Decimal(str(order_data.get("origQty", order_data.get("executedQty", "1.0")))),
-                        executed_quantity=Decimal(str(order_data.get("executedQty", "1.0"))),
-                        cumulative_quote_qty=Decimal(str(order_data.get("cumQuote", order_data.get("cummulativeQuoteQty", str(trade_amt)))))
+                        executed_quantity=exec_q if exec_q > 0 else Decimal("1.0"),
+                        cumulative_quote_qty=cum_q if cum_q > 0 else trade_amt
                     )
                     db.add(new_order)
                     bot.operating_mode = "live" if not conn.is_testnet else "demo"

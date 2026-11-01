@@ -200,6 +200,37 @@ async def close_bot_position(
             await db.close()
 
 
+async def fetch_price_with_mirrors(sym: str, endpoint: str) -> Optional[Decimal]:
+    """Fetches real-time ticker price with multi-mirror fallback to survive cloud datacenter geo-blocks."""
+    import httpx
+    if "futures" in endpoint:
+        urls = [
+            f"https://testnet.binancefuture.com/fapi/v1/ticker/price?symbol={sym}" if "testnet" in endpoint else f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}",
+            f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}",
+            f"https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}"
+        ]
+    else:
+        urls = [
+            f"https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}",
+            f"https://api1.binance.com/api/v3/ticker/price?symbol={sym}",
+            f"https://api3.binance.com/api/v3/ticker/price?symbol={sym}",
+            f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
+        ]
+    async with httpx.AsyncClient(timeout=3.5) as http_client:
+        for u in urls:
+            try:
+                r = await http_client.get(u, headers={"User-Agent": "TradePilotAI/1.0.0"})
+                if r.status_code == 200:
+                    p = r.json().get("price")
+                    if p:
+                        val = Decimal(str(p))
+                        if val > Decimal("0"):
+                            return val
+            except Exception:
+                continue
+    return None
+
+
 async def run_exit_monitor_cycle():
     """Single polling cycle checking all active bot positions against Take Profit, Stop Loss, and Binance real-time status."""
     async with AsyncSessionLocal() as session:
@@ -220,15 +251,19 @@ async def run_exit_monitor_cycle():
             res_c = await session.execute(stmt_conn)
             conn = res_c.scalars().first()
 
+            live_positions_details: Dict[str, Dict[str, Any]] = {}
             open_binance_positions: Dict[str, Decimal] = {}
             if conn and conn.api_key_encrypted and conn.api_secret_encrypted:
                 try:
                     plain_key = decrypt_secret(conn.api_key_encrypted)
                     plain_secret = decrypt_secret(conn.api_secret_encrypted)
                     binance_client = BinanceSpotClient(api_key=plain_key, api_secret=plain_secret, is_testnet=conn.is_testnet)
-                    open_binance_positions = await binance_client.get_open_positions()
+                    live_positions_details = await binance_client.get_live_positions_details()
+                    open_binance_positions = {s: p["position_amt"] for s, p in live_positions_details.items()}
                 except Exception as b_err:
                     logger.warning(f"Failed to fetch Binance positions in exit cycle: {b_err}")
+
+            now_utc = datetime.now(timezone.utc)
 
             # Check each bot against live Binance position and price thresholds
             for bot in active_bots:
@@ -243,45 +278,58 @@ async def run_exit_monitor_cycle():
                     session.add(bot)
                     continue
 
+                # Calculate bot age for opening grace period
+                bot_created = bot.created_at
+                if bot_created:
+                    if bot_created.tzinfo is None:
+                        bot_created = bot_created.replace(tzinfo=timezone.utc)
+                    age_seconds = (now_utc - bot_created).total_seconds()
+                else:
+                    age_seconds = 999999.0
+
                 # If connection is active, verify if position is still open on Binance
                 if conn and open_binance_positions is not None:
                     if sym not in open_binance_positions:
-                        logger.info(f"⚡ Position for {bot.name} ({sym}) was closed on Binance (position = 0). Archiving bot.")
-                        bot.status = "completed"
-                        params["exit_reason"] = "CLOSED_ON_BINANCE"
-                        params["exit_at"] = datetime.now(timezone.utc).isoformat()
-                        config.strategy_params = params
-                        session.add(bot)
-                        session.add(config)
-                        continue
+                        # 60s Opening Grace Period: Never archive brand new bots while Binance fills/indexes the position
+                        if age_seconds < 60.0:
+                            logger.debug(f"Bot {bot.name} ({sym}) is within 60s opening grace period (age={age_seconds:.1f}s), waiting for exchange.")
+                        else:
+                            logger.info(f"⚡ Position for {bot.name} ({sym}) was closed on Binance (position = 0, age={age_seconds:.1f}s). Archiving bot.")
+                            bot.status = "completed"
+                            params["exit_reason"] = "CLOSED_ON_BINANCE"
+                            params["exit_at"] = datetime.now(timezone.utc).isoformat()
+                            config.strategy_params = params
+                            session.add(bot)
+                            session.add(config)
+                            continue
 
                 entry_p_raw = params.get("entry_price")
-                if not entry_p_raw:
-                    continue
+                entry_price = Decimal(str(entry_p_raw)) if entry_p_raw else Decimal("0")
 
-                entry_price = Decimal(str(entry_p_raw))
+                # If position is actively tracked by Binance, update official entry and mark prices
+                cur_price: Optional[Decimal] = None
+                if sym in live_positions_details:
+                    bp = live_positions_details[sym]
+                    if bp.get("entry_price") and bp["entry_price"] > Decimal("0"):
+                        entry_price = bp["entry_price"]
+                        params["entry_price"] = float(entry_price)
+                    if bp.get("mark_price") and bp["mark_price"] > Decimal("0"):
+                        cur_price = bp["mark_price"]
+                        params["current_price"] = float(cur_price)
+
                 if entry_price <= Decimal("0"):
                     continue
 
                 tp_pct = Decimal(str(params.get("take_profit_pct", "10.00")))
                 sl_pct = Decimal(str(params.get("stop_loss_pct", "5.00")))
-                tp_price = Decimal(str(params.get("take_profit_price", str(entry_price * (Decimal("1.0") + tp_pct / Decimal("100.0"))))))
-                sl_price = Decimal(str(params.get("stop_loss_price", str(entry_price * (Decimal("1.0") - sl_pct / Decimal("100.0"))))))
+                tp_price = round(entry_price * (Decimal("1.0") + tp_pct / Decimal("100.0")), 6)
+                sl_price = round(entry_price * (Decimal("1.0") - sl_pct / Decimal("100.0")), 6)
+                params["take_profit_price"] = float(tp_price)
+                params["stop_loss_price"] = float(sl_price)
 
-                # Query current ticker price
-                endpoint = params.get("exchange_endpoint", "futures_testnet")
-                base_url = "https://testnet.binancefuture.com" if "futures" in endpoint else "https://api.binance.com"
-                path = "/fapi/v1/ticker/price" if "futures" in endpoint else "/api/v3/ticker/price"
-
-                import httpx
-                cur_price = None
-                async with httpx.AsyncClient(timeout=4.0) as http_client:
-                    try:
-                        p_res = await http_client.get(f"{base_url}{path}?symbol={sym}")
-                        if p_res.status_code == 200:
-                            cur_price = Decimal(str(p_res.json().get("price", "0")))
-                    except Exception:
-                        pass
+                # Query current ticker price if not already resolved from position details
+                if cur_price is None or cur_price <= Decimal("0"):
+                    cur_price = await fetch_price_with_mirrors(sym, params.get("exchange_endpoint", "futures_testnet"))
 
                 if not cur_price or cur_price <= Decimal("0"):
                     continue
@@ -302,8 +350,14 @@ async def run_exit_monitor_cycle():
                     await close_bot_position(bot.id, reason, db=session)
                     continue
 
+                # Stabilization Cooldown: Don't trigger Stop Loss during the first 15 seconds of a trade!
+                # Prevents premature stop-out from immediate market spread or fill slippage.
+                if age_seconds < 15.0:
+                    logger.debug(f"Bot {bot.name} ({sym}) in 15s entry cooldown ({age_seconds:.1f}s), holding SL trigger.")
+                    continue
+
                 # Check Stop Loss trigger (-5%)
-                if cur_price <= sl_price or pnl_pct <= -sl_pct:
+                if (cur_price <= sl_price or pnl_pct <= -sl_pct) and cur_price > Decimal("0") and sl_price > Decimal("0"):
                     logger.warning(f"🛑 STOP LOSS TRIGGERED for {bot.name} ({sym})! Current: ${cur_price} vs Entry: ${entry_price} (PnL: {pnl_pct:.2f}%)")
                     reason = f"STOP_LOSS_TRIGGERED ({pnl_pct:.2f}% Loss Protection Activated)"
                     await close_bot_position(bot.id, reason, db=session)
