@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
 import httpx
@@ -16,6 +17,51 @@ MIRROR_URLS = [
     "https://api3.binance.com",
     "https://api.binance.com"
 ]
+
+FUTURES_MIRRORS = [
+    "https://fapi.binance.com"
+]
+
+
+def normalize_candidate_symbols(raw_input: str) -> List[str]:
+    """
+    Normalizes any user cryptocurrency input into a prioritized list of
+    Binance trading pair candidates.
+    Supports raw tickers (e.g. BTC, ETH, SOL, PEPE, DOGE, KITE, 牛来),
+    common delimiters (e.g. BTC/USDT, ETH-USDT), and 1000x futures multipliers
+    (e.g. 1000PEPE, 1000SHIB, 1000FLOKI, 1000BONK).
+    """
+    clean = re.sub(r'[\s/:\-_]+', '', raw_input.strip()).upper()
+    if not clean:
+        return ["BTCUSDT"]
+
+    quote_currencies = ("USDT", "USDC", "FDUSD", "BUSD", "TUSD", "BTC", "ETH", "BNB", "EUR", "TRY", "DAI")
+    # A pair must be longer than the quote currency itself (e.g. "BTC" is not a pair, but "ETHBTC" is)
+    has_quote = any(clean.endswith(q) and len(clean) > len(q) for q in quote_currencies)
+
+    candidates = []
+    if has_quote:
+        candidates.append(clean)
+        if clean.endswith("USDT"):
+            base = clean[:-4]
+            if not base.startswith("1000"):
+                candidates.append(f"1000{base}USDT")
+                candidates.append(f"1000000{base}USDT")
+            else:
+                candidates.append(f"{base[4:]}USDT")
+    else:
+        # Base coin entered (e.g. "BTC", "SOL", "PEPE", "DOGE", "SHIB", "KITE", "牛来")
+        candidates.append(f"{clean}USDT")
+        candidates.append(f"1000{clean}USDT")
+        candidates.append(f"1000000{clean}USDT")
+        candidates.append(f"{clean}USDC")
+        candidates.append(f"{clean}FDUSD")
+        candidates.append(f"{clean}BTC")
+        candidates.append(clean)
+
+    # Preserve order while deduplicating
+    seen = set()
+    return [c for c in candidates if not (c in seen or seen.add(c))]
 
 
 def calculate_rsi(closes: List[float], period: int = 14) -> float:
@@ -57,35 +103,83 @@ class GeminiAnalystService:
     AI Market Analyst Service powered by Google Gemini with an internal
     quantitative neural technical fallback engine.
     Generates multi-factor verdicts, support/resistance levels, risk assessments,
-    and natural-language market intelligence.
+    and natural-language market intelligence for ANY Binance listed coin or token.
     """
 
     async def fetch_token_technicals(self, symbol: str) -> Dict[str, Any]:
-        """Fetches live ticker, 24hr stats, and 1h candlestick data across Binance mirrors."""
-        sym = symbol.upper()
+        """
+        Fetches live ticker, 24hr stats, and 1h candlestick data for ANY Binance listed coin/token
+        across Binance Spot and Binance USD-M Futures mirrors.
+        """
+        candidates = normalize_candidate_symbols(symbol)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
+
+        resolved_symbol = None
         ticker_data = {}
-        klines = []
+        market_type = "Binance Spot"
+        is_futures = False
 
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            # 1. Fetch 24h ticker
-            for base_url in MIRROR_URLS:
-                try:
-                    r = await client.get(f"{base_url}/api/v3/ticker/24hr?symbol={sym}")
-                    if r.status_code == 200:
-                        ticker_data = r.json()
+        async with httpx.AsyncClient(timeout=4.5, headers=headers) as client:
+            for cand in candidates:
+                enc = urllib.parse.quote(cand)
+                is_multiplier = cand.startswith("1000")
+                probe_order = [("futures", FUTURES_MIRRORS), ("spot", MIRROR_URLS)] if is_multiplier else [("spot", MIRROR_URLS), ("futures", FUTURES_MIRRORS)]
+
+                for venue_type, mirrors in probe_order:
+                    for base in mirrors:
+                        endpoint = f"{base}/fapi/v1/ticker/24hr?symbol={enc}" if venue_type == "futures" else f"{base}/api/v3/ticker/24hr?symbol={enc}"
+                        try:
+                            r = await client.get(endpoint)
+                            if r.status_code == 200:
+                                data = r.json()
+                                if float(data.get("lastPrice", "0")) > 0:
+                                    resolved_symbol = cand
+                                    ticker_data = data
+                                    market_type = "Binance USD-M Futures" if venue_type == "futures" else "Binance Spot"
+                                    is_futures = (venue_type == "futures")
+                                    break
+                            elif r.status_code == 400:
+                                # Binance actively returned "Invalid symbol", so other mirrors for this venue will return same
+                                break
+                        except Exception:
+                            continue
+                    if resolved_symbol:
                         break
-                except Exception:
-                    continue
+                if resolved_symbol:
+                    break
 
-            # 2. Fetch 1h klines (last 48 candles)
-            for base_url in MIRROR_URLS:
+            if not resolved_symbol or not ticker_data:
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Cryptocurrency '{symbol.upper()}' was not found on Binance Spot or Futures. "
+                           f"Please verify the symbol (e.g. BTC, ETH, SOL, PEPE, DOGE, or full pair like BTCUSDT)."
+                )
+
+            # 3. Fetch 1h klines (last 48 candles) from the matching venue
+            klines = []
+            enc_sym = urllib.parse.quote(resolved_symbol)
+            if is_futures:
+                kline_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={enc_sym}&interval=1h&limit=48"
                 try:
-                    r = await client.get(f"{base_url}/api/v3/klines?symbol={sym}&interval=1h&limit=48")
+                    r = await client.get(kline_url)
                     if r.status_code == 200:
                         klines = r.json()
-                        break
-                except Exception:
-                    continue
+                except Exception as e:
+                    logger.warning(f"Could not fetch futures klines for {resolved_symbol}: {e}")
+            else:
+                for base in MIRROR_URLS:
+                    try:
+                        kline_url = f"{base}/api/v3/klines?symbol={enc_sym}&interval=1h&limit=48"
+                        r = await client.get(kline_url)
+                        if r.status_code == 200:
+                            klines = r.json()
+                            break
+                    except Exception:
+                        continue
 
         cur_price = float(ticker_data.get("lastPrice", "0.0"))
         high_24h = float(ticker_data.get("highPrice", "0.0"))
@@ -110,9 +204,17 @@ class GeminiAnalystService:
         res_1 = round(max(high_24h, max(closes[-12:])) if closes else high_24h, 6)
         res_2 = round(res_1 * 1.035, 6)
 
+        token_name = resolved_symbol
+        for q in ("USDT", "USDC", "FDUSD", "BUSD", "BTC", "ETH"):
+            if token_name.endswith(q) and len(token_name) > len(q):
+                token_name = token_name[:-len(q)]
+                break
+
         return {
-            "symbol": sym,
-            "token": sym.replace("USDT", ""),
+            "symbol": resolved_symbol,
+            "token": token_name,
+            "market_type": market_type,
+            "is_futures": is_futures,
             "price": cur_price,
             "price_change_pct": price_change_pct,
             "high_24h": high_24h,
@@ -125,6 +227,38 @@ class GeminiAnalystService:
             "support_levels": [support_1, support_2],
             "resistance_levels": [res_1, res_2]
         }
+
+    async def search_listed_tokens(self, query: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Searches active Binance listed coins/tokens across 770+ market pairs for instant autocomplete.
+        """
+        from app.api.v1.markets import fetch_binance_tickers
+        tickers = await fetch_binance_tickers()
+        q = (query or "").strip().upper().replace("/", "").replace("-", "")
+
+        results = []
+        for t in tickers:
+            sym = t.symbol.upper()
+            base = sym
+            for qk in ("USDT", "USDC", "FDUSD", "BUSD"):
+                if base.endswith(qk) and len(base) > len(qk):
+                    base = base[:-len(qk)]
+                    break
+
+            if not q or q in sym or q in base:
+                results.append({
+                    "symbol": t.symbol,
+                    "token": base,
+                    "price": float(t.price),
+                    "price_change_24h_pct": float(t.price_change_24h_pct),
+                    "high_24h": float(t.high_24h),
+                    "low_24h": float(t.low_24h),
+                    "quote_volume_24h": float(t.quote_volume_24h),
+                    "market_type": "Binance Listed"
+                })
+                if len(results) >= limit:
+                    break
+        return results
 
     async def analyze_token(
         self,
@@ -227,6 +361,8 @@ Do NOT include markdown formatting or backticks. Return raw JSON only."""
                         parsed["support_levels"] = [s1, s2]
                         parsed["resistance_levels"] = [r1, r2]
                         parsed["rsi_14"] = rsi
+                        parsed["market_type"] = tech.get("market_type", "Binance Spot")
+                        parsed["is_futures"] = tech.get("is_futures", False)
                         parsed["provider"] = "Google Gemini 3.8 Flash"
                         parsed["analysis_provider"] = "Google Gemini 3.8 Flash"
                         parsed["analyzed_at"] = now_utc
@@ -379,6 +515,8 @@ Do NOT include markdown formatting or backticks. Return raw JSON only."""
             "rsi_14": rsi,
             "ema_20": ema20,
             "ema_50": ema50,
+            "market_type": tech.get("market_type", "Binance Spot"),
+            "is_futures": tech.get("is_futures", False),
             "key_catalysts": catalysts[:4],
             "detailed_analysis": detailed,
             "provider": "Gemini 3.8 Flash Quantitative Neural Engine",
